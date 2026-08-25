@@ -27,6 +27,9 @@ main { padding: 28px 0 72px; }
 .metrics strong { font-size: 23px; overflow-wrap: anywhere; }
 .panel { padding: 26px; margin-bottom: 12px; }
 .intent { border-top: 3px solid var(--green); }
+.decision { border-top: 3px solid var(--amber); }
+.decision-accepted { border-color: var(--green); }
+.decision-rejected { border-color: var(--red); }
 .claim { border-top: 3px solid var(--green); }
 .hypothesis { border-top: 3px solid var(--amber); }
 .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
@@ -61,6 +64,10 @@ main { padding: 28px 0 72px; }
 .finding-support { border-left: 3px solid var(--green); padding-left: 14px !important; }
 .finding-mixed { border-left: 3px solid var(--amber); padding-left: 14px !important; }
 .judgment { display: inline-block; margin: 6px 0; }
+.applicability { display: inline-block; padding: 5px 8px; border: 1px solid currentColor; border-radius: 999px; font: 700 10px/1 ui-monospace, monospace; text-transform: uppercase; }
+.applicability-current { color: var(--green); }
+.applicability-stale { color: var(--red); }
+.experiment-stale { opacity: .72; }
 .empty { font-style: italic; }
 .limitations { border-color: #5d4930; }
 ol, .limitations ul { color: var(--ink-muted); line-height: 1.7; }

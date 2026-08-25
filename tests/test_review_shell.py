@@ -95,3 +95,59 @@ def test_phase2_review_markup_exposes_claim_coverage_and_judgment() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_phase2_review_markup_exposes_experiment_applicability_and_decision() -> None:
+    payload = {
+        "snapshot": {"id": "snapshot:1"},
+        "analysis": {"entity_count": 1, "semantic_digest": "digest"},
+        "review": {
+            "intent": {
+                "kind": "experiment",
+                "desired_outcome": "Test tension",
+                "original_prompt": "Test tension.",
+                "scope": [],
+            },
+            "decision": {
+                "state": "revise",
+                "rationale": "Retest the policy.",
+                "decided_by": "designer",
+                "decided_at": "2026-08-26T10:00:00Z",
+            },
+            "experiment_evidence": [
+                {
+                    "kind": "ab_comparison",
+                    "summary": "Candidate did not improve flow.",
+                    "applicability": "stale",
+                    "applicability_reasons": ["source revision changed"],
+                    "hypothesis_link": {
+                        "hypothesis_id": "hypothesis:tension",
+                        "relation": "contradicts",
+                    },
+                }
+            ],
+            "coverage": {"complete": True, "items": []},
+            "claims": [],
+            "hypotheses": [],
+            "critic_findings": [],
+            "policies": [],
+            "critic_routes": [],
+            "alternatives": [],
+            "limitations": [],
+        },
+    }
+    module = Path("src/playtrace/review/app.js").resolve().as_uri()
+    source = (
+        f'import {{ reviewMarkup }} from "{module}"; '
+        f"const html = reviewMarkup({json.dumps(payload)}); "
+        "if (!html.includes('Candidate did not improve flow.') || "
+        "!html.includes('applicability-stale') || "
+        "!html.includes('decision-revise')) process.exit(1);"
+    )
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", source],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr

@@ -6,6 +6,8 @@ from collections import defaultdict
 from statistics import fmean
 from typing import Iterable
 
+from pydantic import model_validator
+
 from playtrace.models import StrictModel
 from playtrace.simulation import SimulationRun, SimulationStatus, TabletopSimulationState
 
@@ -73,6 +75,23 @@ class TensionBatch(StrictModel):
     combinations: tuple[CombinationSummary, ...]
     mean_excitement: float
     combination_excitement_spread: float
+    source_run_ids: tuple[str, ...] = ()
+    snapshot_ids: tuple[str, ...] = ()
+    snapshot_digests: tuple[str, ...] = ()
+    config_digests: tuple[str, ...] = ()
+    config_ids: tuple[str, ...] = ()
+    config_fingerprints: tuple[str, ...] = ()
+    plugin_versions: tuple[str, ...] = ()
+    runners: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def contains_one_design_snapshot(self) -> "TensionBatch":
+        if len(self.snapshot_ids) > 1 or len(self.snapshot_digests) > 1:
+            raise ValueError(
+                "a tension batch cannot mix multiple design snapshots; "
+                "build one batch per snapshot"
+            )
+        return self
 
 
 class CombinationDelta(StrictModel):
@@ -236,6 +255,24 @@ def build_batch(batch_id: str, runs: Iterable[SimulationRun]) -> TensionBatch:
         combinations=summaries,
         mean_excitement=round(fmean(item.excitement_score for item in analyses), 2),
         combination_excitement_spread=round(max(means) - min(means), 2) if means else 0.0,
+        source_run_ids=tuple(run.id for run in runs),
+        snapshot_ids=tuple(dict.fromkeys(run.provenance.snapshot_id for run in runs)),
+        snapshot_digests=tuple(
+            dict.fromkeys(run.provenance.snapshot_digest for run in runs)
+        ),
+        config_digests=tuple(dict.fromkeys(run.provenance.config_digest for run in runs)),
+        config_ids=tuple(dict.fromkeys(run.config.id for run in runs)),
+        config_fingerprints=tuple(
+            dict.fromkeys(
+                f"{run.config.id}@{run.provenance.config_digest}" for run in runs
+            )
+        ),
+        plugin_versions=tuple(
+            dict.fromkeys(
+                f"{run.provenance.plugin_id}@{run.provenance.plugin_version}" for run in runs
+            )
+        ),
+        runners=tuple(dict.fromkeys(run.provenance.runner for run in runs)),
     )
 
 

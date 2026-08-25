@@ -17,6 +17,16 @@ const evidenceMarkup = (links) => links.length
 
 function phase2Markup(payload) {
   const { snapshot, analysis, review } = payload;
+  const decision = review.decision ?? { state: "pending" };
+  const experiments = (review.experiment_evidence ?? []).map((item) => `
+    <article class="argument experiment experiment-${escapeText(item.applicability)}">
+      <p class="eyebrow">EXPERIMENT / ${escapeText(item.kind)}</p>
+      <h3>${escapeText(item.summary)}</h3>
+      <p><strong>Hypothesis:</strong> ${escapeText(item.hypothesis_link.hypothesis_id)}</p>
+      <p><strong>Relation:</strong> ${escapeText(item.hypothesis_link.relation)}</p>
+      <span class="applicability applicability-${escapeText(item.applicability)}">${escapeText(item.applicability)}</span>
+      ${(item.applicability_reasons ?? []).map((reason) => `<p>${escapeText(reason)}</p>`).join("")}
+    </article>`).join("");
   const coverage = review.coverage.items.length
     ? review.coverage.items.map((item) => `
       <li class="coverage-${escapeText(item.status)}">
@@ -70,12 +80,19 @@ function phase2Markup(payload) {
       <p>${escapeText(review.intent.original_prompt)}</p>
       <small>Scope: ${escapeText(review.intent.scope.join(", ") || "whole snapshot")}</small>
     </section>
+    <section class="panel decision decision-${escapeText(decision.state)}">
+      <p class="eyebrow">HUMAN DECISION</p>
+      <h2>${escapeText(decision.state)}</h2>
+      <p>${escapeText(decision.rationale || "No authority decision has been recorded. Canon remains unchanged.")}</p>
+      ${decision.decided_by ? `<small>${escapeText(decision.decided_by)} · ${escapeText(decision.decided_at)}</small>` : ""}
+    </section>
     <div class="columns">
       <section class="panel"><p class="eyebrow">MANDATORY COVERAGE</p><ul class="coverage-list">${coverage}</ul></section>
       <section class="panel"><p class="eyebrow">LAYERED POLICY</p><ul class="knowledge-list">${policies || "<li>No applicable policy.</li>"}</ul></section>
     </div>
     <section class="panel"><p class="eyebrow">CLAIM-LINKED ARGUMENT</p><div class="argument-grid">${claims}</div></section>
     <section class="panel"><p class="eyebrow">HYPOTHESES</p><div class="argument-grid">${hypotheses}</div></section>
+    <section class="panel"><p class="eyebrow">EXPERIMENT EVIDENCE</p><div class="argument-grid">${experiments || empty("No experiment evidence was included.")}</div></section>
     <div class="columns">
       <section class="panel"><p class="eyebrow">CRITIC FINDINGS</p><ul class="findings">${findings || "<li>No findings.</li>"}</ul></section>
       <section class="panel"><p class="eyebrow">CRITIC ROUTING</p><ul class="routes">${routes}</ul></section>

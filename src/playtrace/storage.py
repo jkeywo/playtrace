@@ -6,7 +6,8 @@ import sqlite3
 from pathlib import Path
 
 from playtrace.knowledge import KnowledgeBase
-from playtrace.models import DesignSnapshot, EvidenceClaim
+from playtrace.evidence import ExperimentEvidence
+from playtrace.models import DesignSnapshot, EvidenceClaim, Hypothesis
 from playtrace.reviewing import DesignReview
 from playtrace.simulation import SimulationRun
 from playtrace.workflow import WorkflowRun
@@ -42,6 +43,20 @@ CREATE TABLE IF NOT EXISTS design_reviews (
 CREATE TABLE IF NOT EXISTS simulation_runs (
     id TEXT PRIMARY KEY,
     snapshot_id TEXT NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    payload TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS hypotheses (
+    id TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    payload TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS experiment_evidence (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    snapshot_id TEXT NOT NULL,
+    hypothesis_id TEXT NOT NULL,
     payload TEXT NOT NULL
 );
 
@@ -93,7 +108,10 @@ class PlayTraceStore:
     def save_snapshot(self, snapshot: DesignSnapshot) -> None:
         with self.connection:
             self.connection.execute(
-                "INSERT OR REPLACE INTO snapshots(id, project_id, payload) VALUES (?, ?, ?)",
+                """INSERT INTO snapshots(id, project_id, payload) VALUES (?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       project_id = excluded.project_id,
+                       payload = excluded.payload""",
                 (snapshot.id, snapshot.project_id, snapshot.model_dump_json()),
             )
             self.index(
@@ -119,6 +137,74 @@ class PlayTraceStore:
                 (claim.id, snapshot_id, claim.model_dump_json()),
             )
             self.index(claim.id, "claim", claim.statement, " ".join(claim.scope))
+
+    def load_claim(self, claim_id: str) -> EvidenceClaim | None:
+        row = self.connection.execute(
+            "SELECT payload FROM claims WHERE id = ?", (claim_id,)
+        ).fetchone()
+        return EvidenceClaim.model_validate_json(row["payload"]) if row else None
+
+    def save_hypothesis(self, snapshot_id: str, hypothesis: Hypothesis) -> None:
+        with self.connection:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO hypotheses(id, snapshot_id, payload) VALUES (?, ?, ?)",
+                (hypothesis.id, snapshot_id, hypothesis.model_dump_json()),
+            )
+            self.index(
+                hypothesis.id,
+                "hypothesis",
+                hypothesis.statement,
+                hypothesis.test_method,
+            )
+
+    def load_hypothesis(self, hypothesis_id: str) -> Hypothesis | None:
+        row = self.connection.execute(
+            "SELECT payload FROM hypotheses WHERE id = ?", (hypothesis_id,)
+        ).fetchone()
+        return Hypothesis.model_validate_json(row["payload"]) if row else None
+
+    def save_experiment_evidence(self, evidence: ExperimentEvidence) -> None:
+        with self.connection:
+            self.connection.execute(
+                """INSERT OR REPLACE INTO experiment_evidence
+                   (id, project_id, snapshot_id, hypothesis_id, payload)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    evidence.id,
+                    evidence.project_id,
+                    evidence.snapshot_id,
+                    evidence.hypothesis_link.hypothesis_id,
+                    evidence.model_dump_json(),
+                ),
+            )
+            self.index(
+                evidence.id,
+                "experiment_evidence",
+                evidence.summary,
+                " ".join((*evidence.observations, *evidence.scope)),
+            )
+
+    def load_experiment_evidence(self, evidence_id: str) -> ExperimentEvidence | None:
+        row = self.connection.execute(
+            "SELECT payload FROM experiment_evidence WHERE id = ?", (evidence_id,)
+        ).fetchone()
+        return ExperimentEvidence.model_validate_json(row["payload"]) if row else None
+
+    def list_experiment_evidence(
+        self, *, project_id: str, snapshot_id: str | None = None
+    ) -> tuple[ExperimentEvidence, ...]:
+        if snapshot_id is None:
+            rows = self.connection.execute(
+                "SELECT payload FROM experiment_evidence WHERE project_id = ? ORDER BY id",
+                (project_id,),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                """SELECT payload FROM experiment_evidence
+                   WHERE project_id = ? AND snapshot_id = ? ORDER BY id""",
+                (project_id, snapshot_id),
+            ).fetchall()
+        return tuple(ExperimentEvidence.model_validate_json(row["payload"]) for row in rows)
 
     def save_workflow(self, run: WorkflowRun) -> None:
         with self.connection:
@@ -230,6 +316,8 @@ class PlayTraceStore:
             "workflow_runs",
             "design_reviews",
             "simulation_runs",
+            "hypotheses",
+            "experiment_evidence",
             "policies",
             "precedents",
             "experiential_evidence",

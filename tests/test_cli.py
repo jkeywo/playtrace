@@ -78,3 +78,58 @@ def test_tension_batch_cli_requires_reproducible_inputs() -> None:
 
     assert args.seeds == "1-20"
     assert args.id == "test-batch"
+
+
+def test_record_experiment_cli_requires_explicit_relation_and_rationale() -> None:
+    args = build_parser().parse_args(
+        [
+            "record-experiment",
+            "game",
+            "--snapshot",
+            "snapshot.json",
+            "--hypothesis",
+            "hypothesis.json",
+            "--simulation",
+            "run.json",
+            "--relation",
+            "contradicts",
+            "--rationale",
+            "The observed outcome crosses the contradicting band.",
+        ]
+    )
+
+    assert args.relation == "contradicts"
+    assert args.simulation.name == "run.json"
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            [
+                "record-experiment",
+                "game",
+                "--snapshot",
+                "snapshot.json",
+                "--hypothesis",
+                "hypothesis.json",
+                "--simulation",
+                "run.json",
+            ]
+        )
+
+
+def test_decide_review_cli_does_not_offer_pending_as_a_completed_decision() -> None:
+    parser = build_parser()
+    accepted = parser.parse_args(
+        [
+            "decide-review",
+            "--review-id",
+            "review:1",
+            "--db",
+            "playtrace.db",
+            "--state",
+            "accepted",
+            "--rationale",
+            "Evidence is sufficient.",
+            "--decided-by",
+            "designer",
+        ]
+    )
+    assert accepted.state == "accepted"

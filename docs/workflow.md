@@ -48,6 +48,16 @@ shared policy, and precedent require explicit separately reviewed artefacts.
 Used for claims, hypotheses, alternatives, and suggested direction. It can end
 without a change.
 
+Experiment results enter this review as explicitly hypothesis-linked evidence.
+Recorded dependency revisions and digests determine whether that evidence is
+current or stale. Stale evidence remains visible but cannot satisfy current
+evidence coverage.
+
+A human evidence decision (`pending`, `accepted`, `rejected`, or `revise`) is
+distinct from design-change approval. It records how the evidence should inform
+future reasoning and does not mutate canonical sources, approve a hypothesis,
+or create a ChangeSet.
+
 ### Design-change review
 
 Used for a proposed semantic change to canonical design content. Approval is

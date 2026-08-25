@@ -13,17 +13,19 @@ while a game is being discovered, not only after it has become a specification.
 
 ## Current milestone
 
-**M2: the taste/evidence system is implemented.** Play Trace now resolves
-layered policy, retrieves approved precedents by scope, treats hypotheses and
-experiential evidence as typed records, deterministically validates mandatory
-coverage, routes specialist critics, persists complete reviews, and renders the
-claim-linked argument in the review shell.
+**M3: the experiment evidence loop is implemented.** Play Trace records
+simulation runs, tension batches, and paired A/B comparisons as typed evidence
+linked to an explicit hypothesis. It preserves assumptions and reproducibility
+provenance, marks evidence stale when dependency revisions or digests change,
+and records a separate human review decision without changing canonical game
+files.
 
 An initial deterministic [tabletop simulation layer](docs/simulation.md) now
 turns supported snapshot semantics into replayable traces. It emits typed
 blockers instead of inventing missing rules and links every result to an
 evidence claim with reconstructable provenance.
 
+- [M3 milestone](docs/M3.md)
 - [M2 milestone](docs/M2.md)
 - [M1 milestone](docs/M1.md)
 - [M0 milestone](docs/M0.md)
@@ -102,6 +104,12 @@ uv run playtrace tension-report --baseline baseline.json `
 
 The danger heuristic and flow targets are documented in
 [`docs/tension.md`](docs/tension.md).
+
+To carry a result into review, run `record-experiment` with an explicit
+`supports`, `contradicts`, `context`, or `judgment` relationship; pass its
+bundle to `assess --experiment-evidence`; then use `decide-review` to record the
+human decision. The detailed commands, lifecycle, staleness rules, and authority
+boundary are in [the M3 milestone](docs/M3.md).
 
 To diagnose whether Crisis Wardens can produce a strict trace:
 

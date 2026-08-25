@@ -10,9 +10,20 @@ from pathlib import Path
 from playtrace.adapters import SyntheticProjectAdapter
 from playtrace.analysis import SnapshotAnalyzer
 from playtrace.demo import build_demo_review
+from playtrace.evidence import (
+    ExperimentEvidence,
+    ExperimentEvidenceBundle,
+    ab_comparison_evidence,
+    simulation_evidence,
+    tension_batch_evidence,
+)
 from playtrace.knowledge import load_knowledge
-from playtrace.models import Intent, SourceMedium
-from playtrace.reviewing import Phase2ReviewEngine
+from playtrace.models import DesignSnapshot, EvidenceRelation, Hypothesis, Intent, SourceMedium
+from playtrace.reviewing import (
+    HumanReviewDecision,
+    Phase2ReviewEngine,
+    ReviewDecisionState,
+)
 from playtrace.review_server import serve
 from playtrace.plugins.crisis_wardens import CrisisWardensSimulationPlugin
 from playtrace.simulation import (
@@ -22,7 +33,7 @@ from playtrace.simulation import (
     SimulationRun,
 )
 from playtrace.simulation_report import write_simulation_report
-from playtrace.tension import TensionBatch, build_batch, compare_batches
+from playtrace.tension import ABComparison, TensionBatch, build_batch, compare_batches
 from playtrace.tension_report import write_tension_report
 from playtrace.storage import PlayTraceStore
 from playtrace.tabletop import TabletopProjectAdapter
@@ -72,6 +83,13 @@ def build_parser() -> argparse.ArgumentParser:
     assess.add_argument("--shared-root", type=Path, default=Path.cwd())
     assess.add_argument("--db", type=Path)
     assess.add_argument("--output", type=Path)
+    assess.add_argument(
+        "--experiment-evidence",
+        type=Path,
+        action="append",
+        default=[],
+        help="include a recorded ExperimentEvidence or ExperimentEvidenceBundle JSON file",
+    )
 
     simulate = subparsers.add_parser(
         "simulate", help="run a deterministic tabletop simulation experiment"
@@ -117,6 +135,43 @@ def build_parser() -> argparse.ArgumentParser:
     tension_report.add_argument("--baseline", type=Path, required=True)
     tension_report.add_argument("--candidate", type=Path, required=True)
     tension_report.add_argument("--output", type=Path, required=True)
+
+    record = subparsers.add_parser(
+        "record-experiment",
+        help="record a simulation or tension result as hypothesis-linked evidence",
+    )
+    record.add_argument("project", type=Path)
+    record.add_argument("--snapshot", type=Path, required=True)
+    record.add_argument("--hypothesis", type=Path, required=True)
+    result = record.add_mutually_exclusive_group(required=True)
+    result.add_argument("--simulation", type=Path)
+    result.add_argument("--batch", type=Path)
+    result.add_argument("--comparison", type=Path)
+    record.add_argument("--baseline", type=Path)
+    record.add_argument("--candidate", type=Path)
+    record.add_argument(
+        "--relation",
+        choices=[item.value for item in EvidenceRelation],
+        required=True,
+    )
+    record.add_argument("--rationale", required=True)
+    record.add_argument("--assumption", action="append", default=[])
+    record.add_argument("--db", type=Path)
+    record.add_argument("--output", type=Path)
+
+    decide = subparsers.add_parser(
+        "decide-review", help="record a human decision without applying canonical changes"
+    )
+    decide.add_argument("--review-id", required=True)
+    decide.add_argument("--db", type=Path, required=True)
+    decide.add_argument(
+        "--state",
+        choices=[item.value for item in ReviewDecisionState if item is not ReviewDecisionState.PENDING],
+        required=True,
+    )
+    decide.add_argument("--rationale", required=True)
+    decide.add_argument("--decided-by", required=True)
+    decide.add_argument("--output", type=Path)
     return parser
 
 
@@ -124,6 +179,76 @@ def main() -> None:
     args = build_parser().parse_args()
     if args.command == "review":
         serve(args.host, args.port, args.file)
+        return
+
+    if args.command == "decide-review":
+        with PlayTraceStore(args.db) as store:
+            review_bundle = store.load_review(args.review_id)
+            if review_bundle is None:
+                raise SystemExit(f"review {args.review_id!r} was not found")
+            decision = HumanReviewDecision.decided(
+                ReviewDecisionState(args.state),
+                rationale=args.rationale,
+                decided_by=args.decided_by,
+            )
+            review_bundle = review_bundle.model_copy(update={"decision": decision})
+            store.save_review(review_bundle)
+        payload = {
+            "review": review_bundle.model_dump(mode="json"),
+            "canonical_mutation": False,
+        }
+        rendered = json.dumps(payload, indent=2, default=str)
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(rendered + "\n", encoding="utf-8")
+        print(rendered)
+        return
+
+    if args.command == "record-experiment":
+        snapshot = _load_model(args.snapshot, DesignSnapshot, "snapshot")
+        hypothesis = _load_model(args.hypothesis, Hypothesis, "hypothesis")
+        common = {
+            "project_id": snapshot.project_id,
+            "snapshot": snapshot,
+            "hypothesis": hypothesis,
+            "relation": EvidenceRelation(args.relation),
+            "rationale": args.rationale,
+            "assumptions": tuple(args.assumption),
+        }
+        if args.simulation:
+            run = _load_model(args.simulation, SimulationRun, "simulation")
+            bundle = simulation_evidence(
+                **common, run=run, artifact_path=args.simulation
+            )
+        elif args.batch:
+            batch_result = _load_model(args.batch, TensionBatch)
+            bundle = tension_batch_evidence(
+                **common, batch=batch_result, artifact_path=args.batch
+            )
+        else:
+            if not args.baseline or not args.candidate:
+                raise SystemExit("--comparison requires --baseline and --candidate")
+            comparison = _load_model(args.comparison, ABComparison)
+            baseline = _load_model(args.baseline, TensionBatch)
+            candidate = _load_model(args.candidate, TensionBatch)
+            bundle = ab_comparison_evidence(
+                **common,
+                baseline=baseline,
+                candidate=candidate,
+                comparison=comparison,
+                artifact_path=args.comparison,
+            )
+        db_path = args.db or args.project / ".playtrace" / "playtrace.db"
+        output_path = args.output or args.project / ".playtrace" / "experiment-evidence.json"
+        with PlayTraceStore(db_path) as store:
+            store.save_snapshot(snapshot)
+            store.save_hypothesis(snapshot.id, hypothesis)
+            store.save_experiment_evidence(bundle.evidence)
+            store.save_claim(snapshot.id, bundle.claim)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        rendered = bundle.model_dump_json(indent=2)
+        output_path.write_text(rendered + "\n", encoding="utf-8")
+        print(rendered)
         return
 
     if args.command == "simulation-report":
@@ -196,8 +321,24 @@ def main() -> None:
             raise SystemExit(
                 f"intent project {intent.project_id!r} does not match snapshot project {snapshot.project_id!r}"
             )
+        recorded_evidence: list[ExperimentEvidence] = []
+        recorded_hypotheses: list[Hypothesis] = []
+        for path in args.experiment_evidence:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if "evidence" in payload and "hypothesis" in payload:
+                bundle = ExperimentEvidenceBundle.model_validate(payload)
+                recorded_evidence.append(bundle.evidence)
+                recorded_hypotheses.append(bundle.hypothesis)
+            else:
+                raise SystemExit(
+                    f"{path} is standalone experiment evidence; supply an "
+                    "ExperimentEvidenceBundle so its linked hypothesis is included"
+                )
         review_bundle = Phase2ReviewEngine(args.shared_root, args.project).review(
-            snapshot, intent
+            snapshot,
+            intent,
+            experiment_evidence=recorded_evidence,
+            experiment_hypotheses=recorded_hypotheses,
         )
         analysis = SnapshotAnalyzer().analyze(snapshot)
         payload = {
@@ -214,6 +355,10 @@ def main() -> None:
             )
             for claim in review_bundle.claims:
                 store.save_claim(snapshot.id, claim)
+            for hypothesis in review_bundle.hypotheses:
+                store.save_hypothesis(snapshot.id, hypothesis)
+            for evidence_item in review_bundle.experiment_evidence:
+                store.save_experiment_evidence(evidence_item)
             store.save_review(review_bundle)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
@@ -320,3 +465,10 @@ def _parse_seeds(value: str) -> tuple[int, ...]:
     if not seeds:
         raise SystemExit("at least one seed is required")
     return tuple(dict.fromkeys(seeds))
+
+
+def _load_model(path: Path, model: type, wrapper: str | None = None):
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if wrapper and isinstance(payload, dict):
+        payload = payload.get(wrapper, payload)
+    return model.model_validate(payload)

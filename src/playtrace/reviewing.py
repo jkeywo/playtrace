@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Iterable
@@ -21,6 +22,7 @@ from playtrace.knowledge import (
     ScopedPrecedentRetriever,
     load_knowledge,
 )
+from playtrace.evidence import ExperimentApplicability, ExperimentEvidence
 from playtrace.models import (
     AuthoredStatus,
     DesignSnapshot,
@@ -38,6 +40,40 @@ class CriticStance(StrEnum):
     RISK = "risk"
     OPPORTUNITY = "opportunity"
     MIXED = "mixed"
+
+
+class ReviewDecisionState(StrEnum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    REVISE = "revise"
+
+
+class HumanReviewDecision(StrictModel):
+    state: ReviewDecisionState = ReviewDecisionState.PENDING
+    rationale: str | None = None
+    decided_by: str | None = None
+    decided_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def require_decision_details(self) -> "HumanReviewDecision":
+        if self.state is not ReviewDecisionState.PENDING:
+            if not self.rationale or not self.decided_by or not self.decided_at:
+                raise ValueError("a completed review decision needs rationale, actor, and time")
+        return self
+
+    @classmethod
+    def decided(
+        cls, state: ReviewDecisionState, *, rationale: str, decided_by: str
+    ) -> "HumanReviewDecision":
+        if state is ReviewDecisionState.PENDING:
+            return cls()
+        return cls(
+            state=state,
+            rationale=rationale,
+            decided_by=decided_by,
+            decided_at=datetime.now(UTC),
+        )
 
 
 class CoverageStatus(StrEnum):
@@ -111,6 +147,7 @@ class DesignReview(StrictModel):
     policies: tuple[PolicyClause, ...]
     precedents: tuple[PrecedentMatch, ...]
     experiential_evidence: tuple[ExperientialEvidence, ...]
+    experiment_evidence: tuple[ExperimentEvidence, ...] = ()
     hypotheses: tuple[Hypothesis, ...]
     claims: tuple[EvidenceClaim, ...]
     critic_routes: tuple[CriticRoute, ...]
@@ -119,6 +156,7 @@ class DesignReview(StrictModel):
     coverage: CoverageReport
     alternatives: tuple[str, ...] = ()
     limitations: tuple[str, ...] = ()
+    decision: HumanReviewDecision = HumanReviewDecision()
 
 
 CORE_CRITICS = (
@@ -235,6 +273,7 @@ class MandatoryCoverageEngine:
         claims: Iterable[EvidenceClaim],
         hypotheses: Iterable[Hypothesis],
         findings: Iterable[CriticFinding],
+        experiment_evidence: Iterable[ExperimentEvidence] = (),
     ) -> CoverageReport:
         references: dict[str, set[str]] = defaultdict(set)
         for claim in claims:
@@ -255,6 +294,15 @@ class MandatoryCoverageEngine:
             (policy.id, "hard_policy", "applicable hard policy must be examined")
             for policy in policies
             if policy.severity is PolicySeverity.HARD
+        )
+        targets.extend(
+            (
+                item.id,
+                "current_experiment_evidence",
+                "current hypothesis-linked experiment evidence must be examined",
+            )
+            for item in experiment_evidence
+            if item.applicability is ExperimentApplicability.CURRENT
         )
         entity_ids = {entity.id for entity in snapshot.entities}
         targets.extend(
@@ -295,7 +343,29 @@ class Phase2ReviewEngine:
         self.shared_root = Path(shared_root)
         self.game_root = Path(game_root)
 
-    def review(self, snapshot: DesignSnapshot, intent: Intent) -> DesignReview:
+    def review(
+        self,
+        snapshot: DesignSnapshot,
+        intent: Intent,
+        *,
+        experiment_evidence: Iterable[ExperimentEvidence] = (),
+        experiment_hypotheses: Iterable[Hypothesis] = (),
+    ) -> DesignReview:
+        experiment_evidence = tuple(experiment_evidence)
+        experiment_hypotheses = tuple(experiment_hypotheses)
+        included_hypothesis_ids = {item.id for item in experiment_hypotheses}
+        missing_links = sorted(
+            {
+                item.hypothesis_link.hypothesis_id
+                for item in experiment_evidence
+                if item.hypothesis_link.hypothesis_id not in included_hypothesis_ids
+            }
+        )
+        if missing_links:
+            raise ValueError(
+                "experiment evidence links to hypotheses not included in the review: "
+                + ", ".join(missing_links)
+            )
         knowledge = load_knowledge(self.shared_root, self.game_root)
         systems = _systems(snapshot, intent)
         policies = LayeredPolicyResolver().resolve(
@@ -324,8 +394,19 @@ class Phase2ReviewEngine:
             )
         )
         routes = CriticRouter().route(snapshot, intent)
+        assessed_experiments = tuple(
+            item.assess(snapshot) for item in experiment_evidence
+        )
         claims = self._claims(snapshot, intent, policies, evidence)
-        hypotheses = self._hypotheses(snapshot, claims)
+        experiment_claims = tuple(item.to_claim() for item in assessed_experiments)
+        claims = tuple({item.id: item for item in (*claims, *experiment_claims)}.values())
+        generated_hypotheses = self._hypotheses(snapshot, claims)
+        hypotheses = tuple(
+            {
+                item.id: item
+                for item in (*generated_hypotheses, *tuple(experiment_hypotheses))
+            }.values()
+        )
         findings = self._findings(snapshot, routes, claims, evidence)
         coverage = MandatoryCoverageEngine().validate(
             intent=intent,
@@ -335,6 +416,7 @@ class Phase2ReviewEngine:
             claims=claims,
             hypotheses=hypotheses,
             findings=findings,
+            experiment_evidence=assessed_experiments,
         )
         provenance = CriticFinding(
             id=f"{snapshot.project_id}:finding:coverage",
@@ -359,6 +441,7 @@ class Phase2ReviewEngine:
             policies=policies,
             precedents=precedents,
             experiential_evidence=evidence,
+            experiment_evidence=assessed_experiments,
             hypotheses=hypotheses,
             claims=claims,
             critic_routes=routes,
