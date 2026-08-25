@@ -1,0 +1,322 @@
+"""Small command-line entrypoint for the M0 skeleton."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+
+from playtrace.adapters import SyntheticProjectAdapter
+from playtrace.analysis import SnapshotAnalyzer
+from playtrace.demo import build_demo_review
+from playtrace.knowledge import load_knowledge
+from playtrace.models import Intent, SourceMedium
+from playtrace.reviewing import Phase2ReviewEngine
+from playtrace.review_server import serve
+from playtrace.plugins.crisis_wardens import CrisisWardensSimulationPlugin
+from playtrace.simulation import (
+    DockerSimulationRunner,
+    InProcessSimulationRunner,
+    SimulationConfig,
+    SimulationRun,
+)
+from playtrace.simulation_report import write_simulation_report
+from playtrace.tension import TensionBatch, build_batch, compare_batches
+from playtrace.tension_report import write_tension_report
+from playtrace.storage import PlayTraceStore
+from playtrace.tabletop import TabletopProjectAdapter
+from playtrace.workspace import (
+    FixtureWorkspaceGateway,
+    GoogleWorkspaceGateway,
+    WorkspaceGateway,
+)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="playtrace")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    demo = subparsers.add_parser("demo", help="analyse and persist the synthetic M0 snapshot")
+    demo.add_argument("--medium", choices=[item.value for item in SourceMedium], default="synthetic")
+    demo.add_argument("--db", type=Path, default=Path(".playtrace/playtrace.db"))
+    demo.add_argument("--output", type=Path)
+
+    review = subparsers.add_parser("review", help="serve the claim-linked review shell")
+    review.add_argument("--host", default="127.0.0.1")
+    review.add_argument("--port", type=int, default=8765)
+    review.add_argument("--file", type=Path, help="serve a generated review payload")
+
+    snapshot = subparsers.add_parser(
+        "snapshot", help="build a tabletop snapshot from a game repository"
+    )
+    snapshot.add_argument("project", type=Path)
+    source = snapshot.add_mutually_exclusive_group(required=True)
+    source.add_argument("--fixture", type=Path, help="replay a captured Workspace payload")
+    source.add_argument(
+        "--access-token-env",
+        metavar="ENV_VAR",
+        help="read a Google OAuth bearer token from this environment variable",
+    )
+    snapshot.add_argument("--db", type=Path, default=Path(".playtrace/playtrace.db"))
+    snapshot.add_argument("--output", type=Path)
+
+    assess = subparsers.add_parser(
+        "assess", help="build a claim-linked Phase 2 design review"
+    )
+    assess.add_argument("project", type=Path)
+    assess_source = assess.add_mutually_exclusive_group(required=True)
+    assess_source.add_argument("--fixture", type=Path)
+    assess_source.add_argument("--access-token-env", metavar="ENV_VAR")
+    assess.add_argument("--intent", type=Path, required=True)
+    assess.add_argument("--shared-root", type=Path, default=Path.cwd())
+    assess.add_argument("--db", type=Path)
+    assess.add_argument("--output", type=Path)
+
+    simulate = subparsers.add_parser(
+        "simulate", help="run a deterministic tabletop simulation experiment"
+    )
+    simulate.add_argument("project", type=Path)
+    simulate_source = simulate.add_mutually_exclusive_group(required=True)
+    simulate_source.add_argument("--fixture", type=Path)
+    simulate_source.add_argument("--access-token-env", metavar="ENV_VAR")
+    simulate.add_argument("--config", type=Path, required=True)
+    simulate.add_argument("--runner", choices=("in_process", "docker"), default="in_process")
+    simulate.add_argument("--image")
+    simulate.add_argument("--image-digest")
+    simulate.add_argument("--db", type=Path)
+    simulate.add_argument("--output", type=Path)
+
+    report = subparsers.add_parser(
+        "simulation-report",
+        help="build an interactive HTML report from simulation results",
+    )
+    report.add_argument("--run", type=Path, action="append", required=True)
+    report.add_argument("--output", type=Path, required=True)
+
+    batch = subparsers.add_parser(
+        "simulate-batch", help="measure tension for all Crisis Wardens character combinations"
+    )
+    batch.add_argument("project", type=Path)
+    batch.add_argument("--fixture", type=Path, required=True)
+    batch.add_argument("--config", type=Path, required=True)
+    batch.add_argument("--seeds", default="1-20")
+    batch.add_argument("--id", required=True)
+    batch.add_argument("--output", type=Path, required=True)
+
+    compare = subparsers.add_parser(
+        "compare-batches", help="compare paired tension batches by character combination and seed"
+    )
+    compare.add_argument("--baseline", type=Path, required=True)
+    compare.add_argument("--candidate", type=Path, required=True)
+    compare.add_argument("--output", type=Path, required=True)
+
+    tension_report = subparsers.add_parser(
+        "tension-report", help="build an HTML report for a paired tension A/B test"
+    )
+    tension_report.add_argument("--baseline", type=Path, required=True)
+    tension_report.add_argument("--candidate", type=Path, required=True)
+    tension_report.add_argument("--output", type=Path, required=True)
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    if args.command == "review":
+        serve(args.host, args.port, args.file)
+        return
+
+    if args.command == "simulation-report":
+        runs = []
+        for path in args.run:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            runs.append(SimulationRun.model_validate(payload.get("simulation", payload)))
+        write_simulation_report(runs, args.output)
+        print(args.output.resolve())
+        return
+
+    if args.command == "compare-batches":
+        baseline = TensionBatch.model_validate_json(args.baseline.read_text(encoding="utf-8"))
+        candidate = TensionBatch.model_validate_json(args.candidate.read_text(encoding="utf-8"))
+        comparison = compare_batches(baseline, candidate)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(comparison.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        print(comparison.model_dump_json(indent=2))
+        return
+
+    if args.command == "tension-report":
+        baseline = TensionBatch.model_validate_json(args.baseline.read_text(encoding="utf-8"))
+        candidate = TensionBatch.model_validate_json(args.candidate.read_text(encoding="utf-8"))
+        write_tension_report(
+            baseline, candidate, compare_batches(baseline, candidate), args.output
+        )
+        print(args.output.resolve())
+        return
+
+    if args.command == "simulate-batch":
+        gateway = FixtureWorkspaceGateway.from_file(args.fixture)
+        snapshot = TabletopProjectAdapter.from_path(
+            args.project / "playtrace.toml", gateway
+        ).snapshot()
+        template = SimulationConfig.model_validate_json(args.config.read_text(encoding="utf-8"))
+        if len(template.character_ids) < 2:
+            raise SystemExit("batch config must list both current character IDs")
+        combinations = (
+            (template.character_ids[0],),
+            (template.character_ids[1],),
+            tuple(template.character_ids[:2]),
+        )
+        seeds = _parse_seeds(args.seeds)
+        plugin = CrisisWardensSimulationPlugin()
+        runner = InProcessSimulationRunner()
+        runs = []
+        for characters in combinations:
+            for seed in seeds:
+                config = template.model_copy(
+                    update={
+                        "id": f"{template.id}:{'+'.join(characters)}:seed-{seed}",
+                        "character_ids": characters,
+                        "seed": seed,
+                    }
+                )
+                runs.append(runner.run(plugin, snapshot, config))
+        batch = build_batch(args.id, runs)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(batch.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        print(batch.model_dump_json(indent=2))
+        return
+
+    if args.command == "assess":
+        gateway = _workspace_gateway(args)
+        snapshot = TabletopProjectAdapter.from_path(
+            args.project / "playtrace.toml", gateway
+        ).snapshot()
+        intent = Intent.model_validate_json(args.intent.read_text(encoding="utf-8"))
+        if intent.project_id != snapshot.project_id:
+            raise SystemExit(
+                f"intent project {intent.project_id!r} does not match snapshot project {snapshot.project_id!r}"
+            )
+        review_bundle = Phase2ReviewEngine(args.shared_root, args.project).review(
+            snapshot, intent
+        )
+        analysis = SnapshotAnalyzer().analyze(snapshot)
+        payload = {
+            "snapshot": snapshot.model_dump(mode="json"),
+            "analysis": analysis.model_dump(mode="json"),
+            "review": review_bundle.model_dump(mode="json"),
+        }
+        db_path = args.db or args.project / ".playtrace" / "playtrace.db"
+        output_path = args.output or args.project / ".playtrace" / "review.json"
+        with PlayTraceStore(db_path) as store:
+            store.save_snapshot(snapshot)
+            store.save_knowledge(
+                snapshot.project_id, load_knowledge(args.shared_root, args.project)
+            )
+            for claim in review_bundle.claims:
+                store.save_claim(snapshot.id, claim)
+            store.save_review(review_bundle)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
+        print(json.dumps(payload, indent=2, default=str))
+        return
+
+    if args.command == "simulate":
+        gateway = _workspace_gateway(args)
+        snapshot = TabletopProjectAdapter.from_path(
+            args.project / "playtrace.toml", gateway
+        ).snapshot()
+        if snapshot.project_id != "crisis-wardens":
+            raise SystemExit(
+                f"no simulation plugin is registered for project {snapshot.project_id!r}"
+            )
+        config = SimulationConfig.model_validate_json(
+            args.config.read_text(encoding="utf-8")
+        )
+        plugin = CrisisWardensSimulationPlugin()
+        if args.runner == "docker":
+            if not args.image or not args.image_digest:
+                raise SystemExit("--image and --image-digest are required for the docker runner")
+            runner = DockerSimulationRunner(args.image, image_digest=args.image_digest)
+        else:
+            runner = InProcessSimulationRunner()
+        run = runner.run(plugin, snapshot, config)
+        claim = run.evidence_claim()
+        payload = {
+            "snapshot_id": snapshot.id,
+            "simulation": run.model_dump(mode="json"),
+            "claim": claim.model_dump(mode="json"),
+        }
+        db_path = args.db or args.project / ".playtrace" / "playtrace.db"
+        output_path = args.output or args.project / ".playtrace" / "simulation.json"
+        with PlayTraceStore(db_path) as store:
+            store.save_snapshot(snapshot)
+            store.save_simulation(run)
+            store.save_claim(snapshot.id, claim)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        rendered = json.dumps(payload, indent=2, default=str)
+        output_path.write_text(rendered + "\n", encoding="utf-8")
+        print(rendered)
+        return
+
+    if args.command == "snapshot":
+        manifest_path = args.project / "playtrace.toml"
+        gateway = _workspace_gateway(args)
+        snapshot = TabletopProjectAdapter.from_path(manifest_path, gateway).snapshot()
+        report = SnapshotAnalyzer().analyze(snapshot)
+        with PlayTraceStore(args.db) as store:
+            store.save_snapshot(snapshot)
+        rendered = json.dumps(
+            {
+                "snapshot": snapshot.model_dump(mode="json"),
+                "analysis": report.model_dump(mode="json"),
+            },
+            indent=2,
+            default=str,
+        )
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(rendered + "\n", encoding="utf-8")
+        print(rendered)
+        return
+
+    medium = SourceMedium(args.medium)
+    snapshot = SyntheticProjectAdapter(medium).snapshot()
+    report = SnapshotAnalyzer().analyze(snapshot)
+    with PlayTraceStore(args.db) as store:
+        store.save_snapshot(snapshot)
+        counts = store.export_counts()
+    payload = build_demo_review(medium)
+    payload["storage"] = counts
+    rendered = json.dumps(payload, indent=2, default=str)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(rendered + "\n", encoding="utf-8")
+    print(json.dumps(report.source_neutral_result(), indent=2))
+
+
+def _workspace_gateway(args: argparse.Namespace) -> WorkspaceGateway:
+    if args.fixture is not None:
+        return FixtureWorkspaceGateway.from_file(args.fixture)
+    access_token = os.environ.get(args.access_token_env, "")
+    if not access_token:
+        raise SystemExit(
+            f"environment variable {args.access_token_env!r} is empty or unset"
+        )
+    return GoogleWorkspaceGateway(access_token)
+
+
+def _parse_seeds(value: str) -> tuple[int, ...]:
+    seeds: list[int] = []
+    for part in value.split(","):
+        part = part.strip()
+        if "-" in part:
+            start_text, end_text = part.split("-", 1)
+            start, end = int(start_text), int(end_text)
+            if end < start:
+                raise SystemExit("seed ranges must be ascending")
+            seeds.extend(range(start, end + 1))
+        elif part:
+            seeds.append(int(part))
+    if not seeds:
+        raise SystemExit("at least one seed is required")
+    return tuple(dict.fromkeys(seeds))

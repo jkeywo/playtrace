@@ -1,0 +1,9 @@
+.venv/
+.playtrace/
+__pycache__/
+.pytest_cache/
+.test-tmp/
+.scratch/
+.uv-cache/
+dist/
+*.py[cod]

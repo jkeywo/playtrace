@@ -1,0 +1,9 @@
+{
+  "name": "playtrace-review-shell",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check src/playtrace/review/app.js"
+  }
+}
+

@@ -1,0 +1,24 @@
+{
+  "id": "cw:tension:broad-emergency-pressure-v3",
+  "scenario_id": "SCN-001",
+  "character_ids": ["CHR-001", "CHR-002"],
+  "ruleset_id": "cw:rules:provisional-core-v0.2",
+  "seed": 1,
+  "max_turns": 80,
+  "player_policy": "greedy",
+  "deck_order": [],
+  "overrides": [
+    {
+      "key": "end_turn_pressure",
+      "value": {"emergency": 2},
+      "rationale": "A/B candidate: after each turn during Emergency, apply two Worsens to the least endangered tableau cards.",
+      "canonical": false
+    },
+    {
+      "key": "end_turn_pressure_target",
+      "value": "lowest",
+      "rationale": "Spread the late-game surge across the tableau instead of repeatedly triggering one card.",
+      "canonical": false
+    }
+  ]
+}
