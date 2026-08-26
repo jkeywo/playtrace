@@ -44,6 +44,10 @@ class WorkspaceGateway(Protocol):
         expected_data: list[dict[str, Any]],
     ) -> dict[str, Any]: ...
 
+    def get_start_page_token(self) -> str: ...
+
+    def list_changes(self, page_token: str) -> dict[str, Any]: ...
+
 
 class GoogleWorkspaceGateway:
     """Small direct Google API client with injected OAuth bearer token.
@@ -61,7 +65,7 @@ class GoogleWorkspaceGateway:
         self.timeout = timeout
 
     def get_file(self, file_id: str) -> dict[str, Any]:
-        fields = "id,name,mimeType,modifiedTime,version,parents,webViewLink"
+        fields = "id,name,mimeType,modifiedTime,version,parents,webViewLink,appProperties"
         return self._request(
             "GET",
             f"https://www.googleapis.com/drive/v3/files/{urllib.parse.quote(file_id)}",
@@ -147,6 +151,29 @@ class GoogleWorkspaceGateway:
         del file_id, data, expected_data
         raise WorkspaceConcurrencyError(
             "Google Sheets values writes do not provide an atomic compare-and-write guard"
+        )
+
+    def get_start_page_token(self) -> str:
+        payload = self._request(
+            "GET",
+            "https://www.googleapis.com/drive/v3/changes/startPageToken",
+            query={"supportsAllDrives": "true"},
+        )
+        return str(payload["startPageToken"])
+
+    def list_changes(self, page_token: str) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            "https://www.googleapis.com/drive/v3/changes",
+            query={
+                "pageToken": page_token,
+                "supportsAllDrives": "true",
+                "includeItemsFromAllDrives": "true",
+                "fields": (
+                    "nextPageToken,newStartPageToken,"
+                    "changes(fileId,removed,time,file(id,version,modifiedTime,appProperties))"
+                ),
+            },
         )
 
     def _request(
@@ -246,3 +273,13 @@ class FixtureWorkspaceGateway:
         # Fixture transports are single-threaded. This call represents the
         # provider-side atomic mutation after all predicates passed.
         return self.batch_update_sheet_values(file_id, data)
+
+    def get_start_page_token(self) -> str:
+        return str(self.payload.get("start_page_token", "fixture:0"))
+
+    def list_changes(self, page_token: str) -> dict[str, Any]:
+        return dict(
+            self.payload.get("changes", {}).get(
+                page_token, {"changes": [], "newStartPageToken": page_token}
+            )
+        )

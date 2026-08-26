@@ -25,6 +25,7 @@ from playtrace.knowledge import promote_applied_proposal
 from playtrace.manifest import load_manifest
 from playtrace.models import DesignSnapshot, EvidenceRelation, Hypothesis, Intent, SourceMedium
 from playtrace.reviewing import (
+    CriticRouter,
     HumanReviewDecision,
     Phase2ReviewEngine,
     ReviewDecisionState,
@@ -68,6 +69,11 @@ from playtrace.workspace import (
     GoogleWorkspaceGateway,
     WorkspaceGateway,
 )
+from playtrace.container_contract import verify_container_contract
+from playtrace.migrations import DatabaseVersionError
+from playtrace.workspace_sync import WorkspaceCache, WorkspaceSynchronizer
+from playtrace.critics import CriticExecutorSpec, ExecutorCriticPipeline
+from playtrace.llm import CliModelExecutor, HttpModelExecutor
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,12 +90,71 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--port", type=int, default=8765)
     review.add_argument("--file", type=Path, help="serve a generated review payload")
 
+    serve_local = subparsers.add_parser(
+        "serve", help="serve the unified local review projector and bounded job API"
+    )
+    serve_local.add_argument("--host", default="127.0.0.1")
+    serve_local.add_argument("--port", type=int, default=8765)
+    serve_local.add_argument("--db", type=Path, required=True)
+    serve_local.add_argument("--project-id")
+
+    migrate = subparsers.add_parser("migrate", help="adopt or migrate a Play Trace database")
+    migrate.add_argument("--db", type=Path, required=True)
+
+    doctor = subparsers.add_parser("doctor", help="run local database and container diagnostics")
+    doctor.add_argument("--db", type=Path, required=True)
+    doctor.add_argument("--root", type=Path, default=Path.cwd())
+
+    sync = subparsers.add_parser("sync", help="refresh authoritative Workspace metadata and cache")
+    sync.add_argument("project", type=Path)
+    sync_source = sync.add_mutually_exclusive_group(required=True)
+    sync_source.add_argument("--fixture", type=Path)
+    sync_source.add_argument("--access-token-env", metavar="ENV_VAR")
+    sync.add_argument("--db", type=Path, required=True)
+    sync.add_argument("--app-property", action="append", default=[], metavar="KEY=VALUE")
+    sync.add_argument("--output", type=Path)
+
     recover = subparsers.add_parser("recover", help="retry reverse compensation for a write saga")
     recover.add_argument("--saga-id", required=True)
     recover.add_argument("--db", type=Path, required=True)
     recover.add_argument("--access-token-env", metavar="ENV_VAR", required=True)
     recover.set_defaults(fixture=None)
     recover.add_argument("--output", type=Path)
+
+    container = subparsers.add_parser(
+        "container-doctor", help="verify the pinned isolated simulation container contract"
+    )
+    container.add_argument("--root", type=Path, default=Path.cwd())
+    container.add_argument("--smoke", action="store_true")
+    container.add_argument("--image")
+    container.add_argument("--image-digest")
+
+    critics = subparsers.add_parser(
+        "run-critics", help="run typed critics through local, CLI, then API fallback"
+    )
+    critics.add_argument("--snapshot", type=Path, required=True)
+    critics.add_argument("--intent", type=Path, required=True)
+    critics.add_argument("--db", type=Path, required=True)
+    critics.add_argument("--output", type=Path)
+    critics.add_argument("--timeout", type=float, default=60)
+    critics.add_argument("--local-command", nargs="+")
+    critics.add_argument("--local-model", default="local")
+    critics.add_argument("--cli-command", nargs="+")
+    critics.add_argument("--cli-model", default="subscription-cli")
+    critics.add_argument("--api-endpoint")
+    critics.add_argument("--api-model")
+    critics.add_argument("--api-key-env")
+    critics.add_argument(
+        "--allow-metered-api",
+        action="store_true",
+        help="explicitly permit calls to the configured metered API fallback",
+    )
+    critics.add_argument(
+        "--api-call-budget",
+        type=int,
+        default=0,
+        help="maximum metered API attempts for this invocation",
+    )
 
     snapshot = subparsers.add_parser(
         "snapshot", help="build a tabletop snapshot from a game repository"
@@ -300,6 +365,94 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
 
+    if args.command == "migrate":
+        try:
+            with PlayTraceStore(args.db) as store:
+                payload = {"database": str(args.db), "schema_version": store.schema_version}
+        except DatabaseVersionError as error:
+            raise SystemExit(str(error)) from error
+        print(json.dumps(payload, indent=2))
+        return
+
+    if args.command == "container-doctor":
+        result = verify_container_contract(
+            args.root,
+            smoke=args.smoke,
+            image=args.image,
+            image_digest=args.image_digest,
+        )
+        print(result.model_dump_json(indent=2))
+        if not result.ok:
+            raise SystemExit(1)
+        return
+
+    if args.command == "doctor":
+        checks: dict[str, object] = {}
+        ok = True
+        if not args.db.is_file():
+            ok = False
+            checks["database"] = {
+                "ok": False,
+                "error": f"database does not exist or is not a regular file: {args.db}",
+            }
+        else:
+            try:
+                with PlayTraceStore(args.db) as store:
+                    integrity = store.connection.execute(
+                        "PRAGMA integrity_check"
+                    ).fetchone()[0]
+                    foreign_key_rows = store.connection.execute(
+                        "PRAGMA foreign_key_check"
+                    ).fetchall()
+                    incomplete_sagas = WriteSagaJournal(store.connection).incomplete()
+                    database_ok = (
+                        integrity == "ok"
+                        and not foreign_key_rows
+                        and not incomplete_sagas
+                    )
+                    checks["database"] = {
+                        "ok": database_ok,
+                        "schema_version": store.schema_version,
+                        "integrity": integrity,
+                        "foreign_key_violations": len(foreign_key_rows),
+                        "foreign_key_details": [list(row) for row in foreign_key_rows[:100]],
+                        "incomplete_sagas": len(incomplete_sagas),
+                        "incomplete_saga_ids": [item.id for item in incomplete_sagas],
+                    }
+                    ok = ok and database_ok
+            except Exception as error:
+                ok = False
+                checks["database"] = {"ok": False, "error": str(error)}
+        try:
+            diagnostic = verify_container_contract(args.root)
+            checks["container"] = diagnostic.model_dump(mode="json")
+            ok = ok and diagnostic.ok
+        except Exception as error:
+            ok = False
+            checks["container"] = {"ok": False, "error": str(error)}
+        print(json.dumps({"ok": ok, "checks": checks}, indent=2, default=str))
+        if not ok:
+            raise SystemExit(1)
+        return
+
+    if args.command == "sync":
+        gateway = _workspace_gateway(args)
+        manifest = load_manifest(args.project / "playtrace.toml")
+        expected: dict[str, str] = {}
+        for item in args.app_property:
+            if "=" not in item:
+                raise SystemExit("--app-property must use KEY=VALUE")
+            key, value = item.split("=", 1)
+            if not key:
+                raise SystemExit("--app-property key cannot be empty")
+            expected[key] = value
+        with PlayTraceStore(args.db) as store:
+            result = WorkspaceSynchronizer(
+                gateway, WorkspaceCache(store.connection)
+            ).sync(manifest, expected_app_properties=expected)
+        _emit_model(result, args.output)
+        return
+
     if args.command == "recover":
         gateway = _workspace_gateway(args)
         with PlayTraceStore(args.db) as store:
@@ -309,6 +462,104 @@ def main() -> None:
         _emit_model(saga, args.output)
         if saga.status.value == "recovery_failed":
             raise SystemExit(2)
+        return
+
+    if args.command == "run-critics":
+        snapshot = _load_model(args.snapshot, DesignSnapshot, "snapshot")
+        intent = _load_model(args.intent, Intent, "intent")
+        if intent.project_id != snapshot.project_id:
+            raise SystemExit("critic intent project does not match its snapshot")
+        executors = []
+        if args.local_command:
+            executors.append(
+                (
+                    CriticExecutorSpec(
+                        tier="local",
+                        name=args.local_command[0],
+                        model=args.local_model,
+                        timeout_seconds=args.timeout,
+                    ),
+                    CliModelExecutor(
+                        tuple(args.local_command), args.local_model, timeout=args.timeout
+                    ),
+                )
+            )
+        if args.cli_command:
+            executors.append(
+                (
+                    CriticExecutorSpec(
+                        tier="cli",
+                        name=args.cli_command[0],
+                        model=args.cli_model,
+                        timeout_seconds=args.timeout,
+                    ),
+                    CliModelExecutor(
+                        tuple(args.cli_command), args.cli_model, timeout=args.timeout
+                    ),
+                )
+            )
+        if args.api_endpoint or args.api_model:
+            if not args.api_endpoint or not args.api_model:
+                raise SystemExit("--api-endpoint and --api-model must be supplied together")
+            if not args.allow_metered_api:
+                raise SystemExit("API fallback requires --allow-metered-api")
+            if args.api_call_budget < 1:
+                raise SystemExit("API fallback requires a positive --api-call-budget")
+            if not args.api_key_env:
+                raise SystemExit("API fallback requires --api-key-env")
+            api_key = os.environ.get(args.api_key_env, "")
+            if not api_key:
+                raise SystemExit(
+                    f"API credential environment variable {args.api_key_env!r} is empty"
+                )
+            executors.append(
+                (
+                    CriticExecutorSpec(
+                        tier="api",
+                        name=args.api_endpoint,
+                        model=args.api_model,
+                        timeout_seconds=args.timeout,
+                        metered=True,
+                    ),
+                    HttpModelExecutor(
+                        args.api_endpoint,
+                        args.api_model,
+                        api_key,
+                        timeout=args.timeout,
+                    ),
+                )
+            )
+        if not executors:
+            raise SystemExit("run-critics requires at least one configured executor")
+        runs = ExecutorCriticPipeline(
+            executors,
+            allow_metered_api=args.allow_metered_api,
+            metered_api_budget=args.api_call_budget,
+        ).run(
+            snapshot, intent, CriticRouter().route(snapshot, intent)
+        )
+        with PlayTraceStore(args.db) as store:
+            store.save_snapshot(snapshot)
+            for run in runs:
+                store.save_critic_run(run)
+        rendered = json.dumps(
+            {"runs": [run.model_dump(mode="json") for run in runs]},
+            indent=2,
+            default=str,
+        )
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(rendered + "\n", encoding="utf-8")
+        print(rendered)
+        return
+
+    if args.command == "serve":
+        serve(
+            args.host,
+            args.port,
+            db_path=args.db,
+            project_id=args.project_id,
+        )
         return
 
     if args.command == "propose":

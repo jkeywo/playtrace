@@ -42,6 +42,8 @@ from playtrace.regressions import (
     adopt_legacy_regression_run,
     regression_run_integrity_matches,
 )
+from playtrace.critics import CriticRun
+
 
 _PROPOSAL_ARTIFACT = "design_proposal"
 _REGRESSION_RUN_ARTIFACT = "regression_run"
@@ -51,7 +53,6 @@ _IDENTITY_ADOPTION_KEY = "identity_adoption_complete"
 _IDENTITY_ADOPTION_VERSION = (
     f"{CANONICAL_IDENTITY_SCHEMA}/{CANONICAL_IDENTITY_VERSION}"
 )
-
 
 
 SCHEMA = """
@@ -619,6 +620,20 @@ class PlayTraceStore:
             "INSERT INTO artifact_integrity(kind, id, schema, seal) VALUES (?, ?, ?, ?)",
             (kind, artifact_id, digest_schema, canonical_seal),
         )
+
+    def save_critic_run(self, run: CriticRun) -> None:
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO critic_runs(id, project_id, payload) VALUES (?, ?, ?)",
+                (run.id, run.project_id, run.model_dump_json()),
+            )
+
+    def list_critic_runs(self, project_id: str) -> tuple[CriticRun, ...]:
+        rows = self.connection.execute(
+            "SELECT payload FROM critic_runs WHERE project_id = ? ORDER BY id",
+            (project_id,),
+        ).fetchall()
+        return tuple(CriticRun.model_validate_json(row[0]) for row in rows)
 
     def __enter__(self) -> "PlayTraceStore":
         return self

@@ -37,6 +37,16 @@ function phase2Markup(payload) {
     </li>`).join("");
   const extensions = (payload.extension_proposals ?? []).map((item) => `
     <li><strong>${escapeText(item.title)}</strong><p>${escapeText(item.kind)} · inert review artefact</p></li>`).join("");
+  const sagas = (payload.write_sagas ?? []).map((saga) => `
+    <li class="saga-${escapeText(saga.status)}"><strong>${escapeText(saga.id)}</strong>
+      <p>${escapeText(saga.status)} · ${saga.operations?.filter((item) => item.verified).length ?? 0}/${saga.operations?.length ?? 0} verified</p>
+      ${(saga.failures ?? []).map((failure) => `<small>${escapeText(failure)}</small>`).join("")}
+    </li>`).join("");
+  const criticRuns = (payload.critic_runs ?? []).map((run) => `
+    <li><strong>${escapeText(run.critic_id)}</strong>
+      <p>${run.completed ? "completed" : "executor unavailable"} · ${run.attempts?.length ?? 0} attempt(s)</p>
+      ${(run.findings ?? []).map((finding) => `<p><strong>${escapeText(finding.title)}</strong> — ${escapeText(finding.statement)}</p>`).join("")}
+      <small>${escapeText(run.task_digest)}</small></li>`).join("");
   const decision = review.decision ?? { state: "pending" };
   const experiments = (review.experiment_evidence ?? []).map((item) => `
     <article class="argument experiment experiment-${escapeText(item.applicability)}">
@@ -119,6 +129,10 @@ function phase2Markup(payload) {
       <section class="panel"><p class="eyebrow">INERT EXTENSION PROPOSALS</p><ul class="knowledge-list">${extensions || "<li>No extension proposals were linked.</li>"}</ul></section>
     </div>
     <div class="columns">
+      <section class="panel"><p class="eyebrow">CANONICAL WRITE SAGAS</p><ul class="knowledge-list">${sagas || "<li>No write saga has been recorded.</li>"}</ul></section>
+      <section class="panel"><p class="eyebrow">MODEL CRITIC RUNS</p><ul class="knowledge-list">${criticRuns || "<li>No executor-backed critic run has been recorded.</li>"}</ul></section>
+    </div>
+    <div class="columns">
       <section class="panel"><p class="eyebrow">CRITIC FINDINGS</p><ul class="findings">${findings || "<li>No findings.</li>"}</ul></section>
       <section class="panel"><p class="eyebrow">CRITIC ROUTING</p><ul class="routes">${routes}</ul></section>
     </div>
@@ -135,7 +149,9 @@ function legacyMarkup(payload) {
 }
 
 export function reviewMarkup(payload) {
-  return payload.review ? phase2Markup(payload) : legacyMarkup(payload);
+  if (payload.review) return phase2Markup(payload);
+  if (payload.claim && payload.hypothesis) return legacyMarkup(payload);
+  return empty("No stored design review is available yet.");
 }
 
 export async function loadReview(fetcher = fetch) {
@@ -148,7 +164,9 @@ if (typeof document !== "undefined") {
   loadReview()
     .then((payload) => {
       document.querySelector("#project-summary").textContent =
-        `${payload.snapshot.project_id} · ${payload.snapshot.source_revisions.length} source revisions`;
+        payload.snapshot
+          ? `${payload.snapshot.project_id} · ${payload.snapshot.source_revisions.length} source revisions`
+          : `${payload.project_id ?? "Play Trace"} · no stored review`;
       document.querySelector("#review").innerHTML = reviewMarkup(payload);
     })
     .catch((error) => {

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import re
+import stat
 import subprocess
 import tempfile
 from datetime import UTC, datetime
@@ -399,8 +402,14 @@ class DockerSimulationRunner:
         memory: str = "256m",
         cpus: str = "1.0",
     ) -> None:
-        if not image_digest.startswith("sha256:"):
-            raise ValueError("a pinned container image digest is required")
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest):
+            raise ValueError(
+                "a pinned container image digest must be sha256:<64 lowercase hex>"
+            )
+        if not image or "@" in image or any(character.isspace() for character in image):
+            raise ValueError("container image must be a non-empty unpinned image reference")
+        if not 1 <= timeout_seconds <= 3600:
+            raise ValueError("container timeout must be between 1 and 3600 seconds")
         self.image = image
         self.image_digest = image_digest
         self.timeout_seconds = timeout_seconds
@@ -470,12 +479,20 @@ class DockerSimulationRunner:
     def run(
         self, plugin: SimulationPlugin, snapshot: DesignSnapshot, config: SimulationConfig
     ) -> SimulationRun:
-        with tempfile.TemporaryDirectory(prefix="playtrace-sim-input-") as input_name, tempfile.TemporaryDirectory(
-            prefix="playtrace-sim-output-"
-        ) as output_name:
-            input_dir, output_dir = Path(input_name), Path(output_name)
+        with tempfile.TemporaryDirectory(prefix="playtrace-sim-") as work_name:
+            work_dir = Path(work_name)
+            input_dir = work_dir / "input"
+            output_dir = work_dir / "output"
+            input_dir.mkdir(mode=0o755)
+            output_dir.mkdir(mode=0o733)
+            # Docker's non-root UID is unrelated to the host user. Bind only
+            # these narrow child directories and grant the minimum traversal /
+            # creation rights needed by the read-only input and writable output.
+            os.chmod(input_dir, 0o755)
+            os.chmod(output_dir, 0o733)
             request = self.request_payload(plugin, snapshot, config)
-            (input_dir / "request.json").write_text(
+            request_path = input_dir / "request.json"
+            request_path.write_text(
                 json.dumps(
                     request,
                     allow_nan=False,
@@ -485,15 +502,20 @@ class DockerSimulationRunner:
                 ),
                 encoding="utf-8",
             )
+            os.chmod(request_path, 0o444)
             subprocess.run(
                 self.command(input_dir.resolve(), output_dir.resolve()),
                 check=True,
                 timeout=self.timeout_seconds,
-                capture_output=True,
-                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
+            result_path = output_dir / "result.json"
+            result_info = result_path.lstat()
+            if result_path.is_symlink() or not stat.S_ISREG(result_info.st_mode):
+                raise ValueError("container result must be a regular non-symlink file")
             result = SimulationRun.model_validate(
-                load_bounded_json_file(output_dir / "result.json")
+                load_bounded_json_file(result_path)
             )
             return result.model_copy(
                 update={

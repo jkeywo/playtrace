@@ -13,6 +13,12 @@ while a game is being discovered, not only after it has become a specification.
 
 ## Current milestone
 
+**M6: local-first production hardening is implemented.** Versioned SQLite
+migrations, authoritative revision-aware Workspace caching, durable canonical
+write sagas, typed bounded critic fallback, a loopback-only unified review API,
+and a pinned simulation-container contract make the M0–M5 workflow safer to run
+locally. See [`docs/M6.md`](docs/M6.md) for operating commands and boundaries.
+
 **M5: approval and durable learning are implemented.** Typed proposals bind the
 complete evidence/policy/snapshot basis to a digest, keep immutable decision and
 application history, and separate human approval from canonical application.
