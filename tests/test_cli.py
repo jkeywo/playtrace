@@ -133,3 +133,74 @@ def test_decide_review_cli_does_not_offer_pending_as_a_completed_decision() -> N
         ]
     )
     assert accepted.state == "accepted"
+
+
+def test_m5_cli_exposes_separate_approval_apply_and_learning_workflows() -> None:
+    parser = build_parser()
+    submit = parser.parse_args(
+        ["submit-proposal", "--proposal-id", "p1", "--db", "p.db", "--actor", "a", "--rationale", "ready"]
+    )
+    approve = parser.parse_args(
+        ["decide-proposal", "--proposal-id", "p1", "--db", "p.db", "--actor", "a", "--rationale", "yes", "--state", "approved"]
+    )
+    dry = parser.parse_args(
+        ["dry-run-proposal", "game", "--fixture", "f.json", "--proposal-id", "p1", "--db", "p.db", "--actor", "a"]
+    )
+    apply = parser.parse_args(
+        ["apply-proposal", "game", "--access-token-env", "TOKEN", "--proposal-id", "p1", "--db", "p.db", "--actor", "a"]
+    )
+    promote = parser.parse_args(
+        ["promote-precedent", "game", "--proposal-id", "p1", "--db", "p.db", "--decision", "yes", "--rationale", "passed"]
+    )
+    accept_case = parser.parse_args(
+        [
+            "accept-regression-case",
+            "--case",
+            "case.json",
+            "--proposal-id",
+            "p1",
+            "--db",
+            "p.db",
+            "--actor",
+            "owner",
+            "--rationale",
+            "Applied behavior approved.",
+        ]
+    )
+    submit_extension = parser.parse_args(
+        [
+            "submit-extension",
+            "--proposal-id",
+            "e1",
+            "--db",
+            "p.db",
+            "--actor",
+            "owner",
+            "--rationale",
+            "Review it.",
+        ]
+    )
+
+    assert submit.command == "submit-proposal"
+    assert approve.state == "approved"
+    assert dry.command == "dry-run-proposal"
+    assert apply.command == "apply-proposal"
+    assert promote.command == "promote-precedent"
+    assert accept_case.command == "accept-regression-case"
+    assert submit_extension.command == "submit-extension"
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "apply-proposal",
+                "game",
+                "--fixture",
+                "f.json",
+                "--proposal-id",
+                "p1",
+                "--db",
+                "p.db",
+                "--actor",
+                "a",
+            ]
+        )

@@ -151,3 +151,31 @@ def test_phase2_review_markup_exposes_experiment_applicability_and_decision() ->
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_review_markup_links_proposals_regressions_and_inert_extensions_read_only() -> None:
+    payload = {
+        "snapshot": {"id": "snapshot:1"},
+        "analysis": {"entity_count": 1, "semantic_digest": "digest"},
+        "review": {
+            "intent": {"kind": "change_request", "desired_outcome": "Change", "original_prompt": "Change", "scope": []},
+            "coverage": {"complete": True, "items": []},
+            "claims": [], "hypotheses": [], "critic_findings": [], "policies": [],
+            "critic_routes": [], "alternatives": [], "limitations": [],
+        },
+        "proposals": [{
+            "proposal": {"id": "proposal:1", "title": "A proposal", "question": "Change it?", "state": "approved", "basis_digest": "abc"},
+            "attempts": [],
+        }],
+        "regression_runs": [{"suite_id": "suite:1", "passed": True, "digest": "def"}],
+        "extension_proposals": [{"title": "Suggested grammar", "kind": "cnl_grammar"}],
+    }
+    module = Path("src/playtrace/review/app.js").resolve().as_uri()
+    source = (
+        f'import {{ reviewMarkup }} from "{module}"; '
+        f"const html = reviewMarkup({json.dumps(payload)}); "
+        "if (!html.includes('A proposal') || !html.includes('suite:1') || "
+        "!html.includes('Suggested grammar') || !html.includes('READ ONLY')) process.exit(1);"
+    )
+    result = subprocess.run(["node", "--input-type=module", "-e", source], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr

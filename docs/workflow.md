@@ -61,7 +61,16 @@ or create a ChangeSet.
 ### Design-change review
 
 Used for a proposed semantic change to canonical design content. Approval is
-specific to the ChangeSet and known source revisions.
+specific to the ChangeSet, semantic patch, complete evidence/policy basis, and
+known source revisions. The basis is content-digested; changing any embedded
+record requires a new approval. Proposal transitions and application attempts
+are append-only.
+
+Approval does not write. An explicit apply operation rechecks the basis and
+native revisions, dry-runs every patch, then writes. It rebuilds the snapshot
+and runs required postconditions and behavioral regressions. Write failures and
+post-write validation failures remain distinct because the latter means canon
+changed but did not pass the gate.
 
 ### Implementation review
 
@@ -69,10 +78,17 @@ Used when executable code or generated artefacts implement an approved design.
 It verifies that implementation matches the accepted direction. Design approval
 does not imply implementation approval.
 
-## M0 implementation boundary
+## Durable learning
 
-M0 implements the graph, immutable workflow-run state, and transition
-validation. It does not yet orchestrate source synchronization, critics,
-approval persistence, or canonical writes. The next integration milestone will
-exercise the graph across the Play Trace/game-repository boundary; Drive
-mutation remains outside that slice.
+Only an applied-and-validated proposal can be promoted into accepted precedent,
+and promotion is an explicit operation into the owning game's repository.
+Approved and adversarial behavioral cases are deterministic regressions;
+rejected cases are excluded. Generated plugin, grammar, and RuleIR suggestions
+remain inert proposals until implemented through the normal reviewed code path.
+
+## Initial implementation boundary
+
+M0 introduced the graph and immutable workflow-run state. M5 now orchestrates
+approval-gated bounded writes, rebuild validation, regressions, and precedent
+promotion. Multi-file compensating transactions, production synchronization,
+and hosted operations remain M6 concerns.

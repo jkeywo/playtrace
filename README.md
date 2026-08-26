@@ -13,7 +13,15 @@ while a game is being discovered, not only after it has become a specification.
 
 ## Current milestone
 
-**M4: the tabletop compiler and semantic strictness boundary are implemented.**
+**M5: approval and durable learning are implemented.** Typed proposals bind the
+complete evidence/policy/snapshot basis to a digest, keep immutable decision and
+application history, and separate human approval from canonical application.
+Approved changes are preflighted, rebuilt, and checked against postconditions
+and behavioral regressions. Only successfully applied proposals can be promoted
+into game-owned precedent; generated engine extensions remain inert review
+artefacts.
+
+M4's tabletop compiler and semantic strictness boundary are implemented.
 Exact Improve, Worsen, and cube Transfer rules can execute from typed RuleIR;
 selector phrases require an explicit game-owned resolver. Plugins are resolved
 through a registry, scripted policies never invent fallback actions, and every
@@ -32,6 +40,7 @@ turns supported snapshot semantics into replayable traces. It emits typed
 blockers instead of inventing missing rules and links every result to an
 evidence claim with reconstructable provenance.
 
+- [M5 milestone](docs/M5.md)
 - [M4 milestone](docs/M4.md)
 - [M3 milestone](docs/M3.md)
 - [M2 milestone](docs/M2.md)
@@ -126,3 +135,11 @@ uv run playtrace simulate C:\AnalogueGames\crisiswardens `
   --fixture C:\AnalogueGames\crisiswardens\tests\fixtures\workspace.json `
   --config C:\AnalogueGames\crisiswardens\design\simulation\strict-first-trace.json
 ```
+
+The M5 proposal flow uses distinct commands for `propose`, `submit-proposal`,
+`decide-proposal`, `dry-run-proposal`, and `apply-proposal`. Fixtures support
+dry-runs; application requires a live writable Workspace connection. Successful
+applications may then be promoted explicitly with `promote-precedent` or used
+to accept an approved-behavior case through `accept-regression-case`. Accepted
+cases are reverified before `run-regressions`. See [M5](docs/M5.md) for the
+authority and failure boundaries.

@@ -10,6 +10,8 @@ from typing import Any, Protocol
 
 
 class WorkspaceGateway(Protocol):
+    supports_canonical_writes: bool
+
     def get_file(self, file_id: str) -> dict[str, Any]: ...
 
     def get_document(self, file_id: str) -> dict[str, Any]: ...
@@ -38,6 +40,8 @@ class GoogleWorkspaceGateway:
     Authentication and token refresh deliberately remain outside the adapter so
     desktop, CLI, and hosted deployments can supply credentials differently.
     """
+
+    supports_canonical_writes = True
 
     def __init__(self, access_token: str, timeout: float = 60) -> None:
         if not access_token:
@@ -140,6 +144,8 @@ class GoogleWorkspaceGateway:
 
 class FixtureWorkspaceGateway:
     """Replay a project-owned Workspace capture without network credentials."""
+
+    supports_canonical_writes = False
 
     def __init__(self, payload: dict[str, Any]) -> None:
         self.payload = payload

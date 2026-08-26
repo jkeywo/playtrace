@@ -17,6 +17,26 @@ const evidenceMarkup = (links) => links.length
 
 function phase2Markup(payload) {
   const { snapshot, analysis, review } = payload;
+  const proposals = (payload.proposals ?? []).map((record) => {
+    const proposal = record.proposal ?? record;
+    const attempts = record.attempts ?? [];
+    const latest = attempts.at(-1);
+    return `<article class="argument proposal proposal-${escapeText(proposal.state)}">
+      <p class="eyebrow">DESIGN PROPOSAL / ${escapeText(proposal.state)}</p>
+      <h3>${escapeText(proposal.title)}</h3>
+      <p>${escapeText(proposal.question)}</p>
+      <small>Basis ${escapeText(proposal.basis_digest)} · ${escapeText(proposal.id)}</small>
+      ${latest ? `<p><strong>Latest application:</strong> ${escapeText(latest.status)} — ${escapeText(latest.message || "")}</p>` : ""}
+    </article>`;
+  }).join("");
+  const regressionRuns = (payload.regression_runs ?? []).map((run) => `
+    <li class="regression-${run.passed ? "passed" : "failed"}">
+      <strong>${escapeText(run.suite_id)}</strong>
+      <span>${run.passed ? "passed" : "failed"}</span>
+      <small>${escapeText(run.digest)}</small>
+    </li>`).join("");
+  const extensions = (payload.extension_proposals ?? []).map((item) => `
+    <li><strong>${escapeText(item.title)}</strong><p>${escapeText(item.kind)} · inert review artefact</p></li>`).join("");
   const decision = review.decision ?? { state: "pending" };
   const experiments = (review.experiment_evidence ?? []).map((item) => `
     <article class="argument experiment experiment-${escapeText(item.applicability)}">
@@ -93,6 +113,11 @@ function phase2Markup(payload) {
     <section class="panel"><p class="eyebrow">CLAIM-LINKED ARGUMENT</p><div class="argument-grid">${claims}</div></section>
     <section class="panel"><p class="eyebrow">HYPOTHESES</p><div class="argument-grid">${hypotheses}</div></section>
     <section class="panel"><p class="eyebrow">EXPERIMENT EVIDENCE</p><div class="argument-grid">${experiments || empty("No experiment evidence was included.")}</div></section>
+    <section class="panel"><p class="eyebrow">DESIGN PROPOSALS / READ ONLY</p><div class="argument-grid">${proposals || empty("No design proposals were linked.")}</div></section>
+    <div class="columns">
+      <section class="panel"><p class="eyebrow">BEHAVIORAL REGRESSIONS</p><ul class="knowledge-list">${regressionRuns || "<li>No regression runs were linked.</li>"}</ul></section>
+      <section class="panel"><p class="eyebrow">INERT EXTENSION PROPOSALS</p><ul class="knowledge-list">${extensions || "<li>No extension proposals were linked.</li>"}</ul></section>
+    </div>
     <div class="columns">
       <section class="panel"><p class="eyebrow">CRITIC FINDINGS</p><ul class="findings">${findings || "<li>No findings.</li>"}</ul></section>
       <section class="panel"><p class="eyebrow">CRITIC ROUTING</p><ul class="routes">${routes}</ul></section>

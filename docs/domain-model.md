@@ -146,6 +146,29 @@ A human review result—accepted, rejected, or deferred—linked to the exact
 proposal and evidence state reviewed. Durable policy or precedent is created
 only by an explicit accepted artefact intended for that purpose.
 
+### DesignProposal
+
+The approval unit for a canonical change. It embeds the semantic `ChangeSet`,
+native `SemanticPatchSet`, complete review basis, postconditions, and referenced
+regressions. A digest binds all basis content. Its immutable history separates
+drafting, submission, approval/rejection/revision, application, write failure,
+and post-write validation failure.
+
+### BehavioralRegressionCase
+
+A proposed deterministic expected behavior that enters suites only after an
+explicit acceptance decision. Approved behavior retains the verified applied
+proposal, successful application attempt, and basis digest that established
+it; a claimed proposal ID alone is insufficient. Adversarial cases require a
+nonblank rationale. A run has a stable clock-independent digest.
+
+### GeneratedExtensionProposal
+
+An inert suggestion for a plugin, CNL grammar, or RuleIR extension. Immutable
+generated content has a separate digest from its append-only review lifecycle
+(`proposed`, `pending`, `approved`, `rejected`, or `revise`). It cannot
+dynamically register, compile, load, or execute source text.
+
 ## Separate dimensions that must not be collapsed
 
 | Dimension | Question |

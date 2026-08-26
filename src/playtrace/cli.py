@@ -20,6 +20,8 @@ from playtrace.evidence import (
     tension_batch_evidence,
 )
 from playtrace.knowledge import load_knowledge
+from playtrace.knowledge import promote_applied_proposal
+from playtrace.manifest import load_manifest
 from playtrace.models import DesignSnapshot, EvidenceRelation, Hypothesis, Intent, SourceMedium
 from playtrace.reviewing import (
     HumanReviewDecision,
@@ -34,12 +36,32 @@ from playtrace.simulation import (
     SimulationConfig,
     SimulationJsonInputError,
     SimulationRun,
+    content_digest,
     load_bounded_json_file,
 )
 from playtrace.simulation_report import write_simulation_report
 from playtrace.tension import ABComparison, TensionBatch, build_batch, compare_batches
 from playtrace.tension_report import write_tension_report
 from playtrace.storage import PlayTraceStore
+from playtrace.extensions import (
+    ExtensionProposalState,
+    GeneratedExtensionProposal,
+    transition_extension,
+)
+from playtrace.patches import SemanticPatchExecutor
+from playtrace.proposals import (
+    ProposalOrchestrator,
+    ProposalRecord,
+    ProposalState,
+    RegressionOutcome,
+    transition_proposal,
+)
+from playtrace.regressions import (
+    BehavioralRegressionCase,
+    BehavioralRegressionRunner,
+    BehavioralRegressionSuite,
+    RegressionCaseKind,
+)
 from playtrace.tabletop import TabletopProjectAdapter
 from playtrace.workspace import (
     FixtureWorkspaceGateway,
@@ -176,11 +198,290 @@ def build_parser() -> argparse.ArgumentParser:
     decide.add_argument("--rationale", required=True)
     decide.add_argument("--decided-by", required=True)
     decide.add_argument("--output", type=Path)
+
+    propose = subparsers.add_parser("propose", help="persist a typed design proposal record")
+    propose.add_argument("--record", type=Path, required=True)
+    propose.add_argument("--db", type=Path, required=True)
+    propose.add_argument("--output", type=Path)
+
+    submit = subparsers.add_parser("submit-proposal", help="submit a draft for approval")
+    _proposal_transition_arguments(submit)
+
+    proposal_decision = subparsers.add_parser(
+        "decide-proposal", help="approve, reject, or return a submitted proposal for revision"
+    )
+    _proposal_transition_arguments(proposal_decision)
+    proposal_decision.add_argument(
+        "--state",
+        choices=(ProposalState.APPROVED.value, ProposalState.REJECTED.value, ProposalState.REVISE.value),
+        required=True,
+    )
+
+    dry_run = subparsers.add_parser(
+        "dry-run-proposal", help="recheck an approved proposal without canonical writes"
+    )
+    dry_run.add_argument("project", type=Path)
+    dry_source = dry_run.add_mutually_exclusive_group(required=True)
+    dry_source.add_argument("--fixture", type=Path)
+    dry_source.add_argument("--access-token-env", metavar="ENV_VAR")
+    _proposal_action_arguments(dry_run)
+
+    apply = subparsers.add_parser(
+        "apply-proposal", help="apply an approved proposal to a live writable workspace"
+    )
+    apply.add_argument("project", type=Path)
+    apply.add_argument("--access-token-env", metavar="ENV_VAR", required=True)
+    apply.set_defaults(fixture=None)
+    _proposal_action_arguments(apply)
+
+    promote = subparsers.add_parser(
+        "promote-precedent", help="explicitly promote an applied proposal into its game repository"
+    )
+    promote.add_argument("project", type=Path)
+    promote.add_argument("--proposal-id", required=True)
+    promote.add_argument("--db", type=Path, required=True)
+    promote.add_argument("--decision", required=True)
+    promote.add_argument("--rationale", required=True)
+    promote.add_argument("--consequence", action="append", default=[])
+
+    regress = subparsers.add_parser(
+        "run-regressions", help="run an accepted deterministic behavioral regression suite"
+    )
+    regress.add_argument("--suite", type=Path, required=True)
+    regress.add_argument("--snapshot", type=Path, required=True)
+    regress.add_argument("--db", type=Path, required=True)
+    regress.add_argument("--output", type=Path)
+
+    accept_case = subparsers.add_parser(
+        "accept-regression-case",
+        help="accept a proposed case after verifying its applied-proposal origin",
+    )
+    accept_case.add_argument("--case", type=Path, required=True)
+    accept_case.add_argument("--proposal-id")
+    accept_case.add_argument("--db", type=Path, required=True)
+    accept_case.add_argument("--actor", required=True)
+    accept_case.add_argument("--rationale", required=True)
+    accept_case.add_argument("--output", type=Path)
+
+    extension = subparsers.add_parser(
+        "propose-extension", help="persist an inert generated plugin, grammar, or RuleIR proposal"
+    )
+    extension.add_argument("--proposal", type=Path, required=True)
+    extension.add_argument("--db", type=Path, required=True)
+    extension.add_argument("--output", type=Path)
+
+    submit_extension = subparsers.add_parser(
+        "submit-extension", help="submit an inert extension proposal for human review"
+    )
+    _extension_transition_arguments(submit_extension)
+    decide_extension = subparsers.add_parser(
+        "decide-extension", help="approve, reject, or request revision of an extension"
+    )
+    _extension_transition_arguments(decide_extension)
+    decide_extension.add_argument(
+        "--state",
+        choices=(
+            ExtensionProposalState.APPROVED.value,
+            ExtensionProposalState.REJECTED.value,
+            ExtensionProposalState.REVISE.value,
+        ),
+        required=True,
+    )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
+
+    if args.command == "propose":
+        record = _load_model(args.record, ProposalRecord)
+        with PlayTraceStore(args.db) as store:
+            store.save_proposal(record)
+        _emit_model(record, args.output)
+        return
+
+    if args.command in {"submit-proposal", "decide-proposal"}:
+        with PlayTraceStore(args.db) as store:
+            record = store.load_proposal(args.proposal_id)
+            if record is None:
+                raise SystemExit(f"proposal {args.proposal_id!r} was not found")
+            target = (
+                ProposalState.PENDING
+                if args.command == "submit-proposal"
+                else ProposalState(args.state)
+            )
+            record = transition_proposal(
+                record, target, actor=args.actor, rationale=args.rationale
+            )
+            store.save_proposal(record)
+        _emit_model(record, args.output)
+        return
+
+    if args.command in {"dry-run-proposal", "apply-proposal"}:
+        gateway = _workspace_gateway(args)
+        adapter = TabletopProjectAdapter.from_path(args.project / "playtrace.toml", gateway)
+        snapshot = adapter.snapshot()
+        with PlayTraceStore(args.db) as store:
+            record = store.load_proposal(args.proposal_id)
+            if record is None:
+                raise SystemExit(f"proposal {args.proposal_id!r} was not found")
+
+            def run_referenced(proposal, rebuilt):
+                cases = []
+                for case_id in proposal.regression_case_ids:
+                    case = store.load_regression_case(case_id)
+                    if case is None:
+                        return (
+                            RegressionOutcome(
+                                suite_id=f"{proposal.id}:referenced-regressions",
+                                passed=False,
+                                case_ids=(case_id,),
+                                failed_case_ids=(case_id,),
+                                digest=content_digest({"missing": case_id}),
+                            ),
+                        )
+                    try:
+                        case = store.validate_regression_case(case)
+                    except ValueError as error:
+                        return (
+                            RegressionOutcome(
+                                suite_id=f"{proposal.id}:referenced-regressions",
+                                passed=False,
+                                case_ids=(case_id,),
+                                failed_case_ids=(case_id,),
+                                digest=content_digest(
+                                    {"invalid_case_origin": case_id, "error": str(error)}
+                                ),
+                            ),
+                        )
+                    expected = proposal.basis.regression_records.get(case_id)
+                    if case.model_dump(mode="json") != expected:
+                        return (
+                            RegressionOutcome(
+                                suite_id=f"{proposal.id}:referenced-regressions",
+                                passed=False,
+                                case_ids=(case_id,),
+                                failed_case_ids=(case_id,),
+                                digest=content_digest(
+                                    {"basis_mismatch": case_id, "actual": case.model_dump(mode="json")}
+                                ),
+                            ),
+                        )
+                    cases.append(case)
+                if not cases:
+                    return ()
+                suite = BehavioralRegressionSuite(
+                    id=f"{proposal.id}:referenced-regressions",
+                    project_id=proposal.project_id,
+                    cases=tuple(cases),
+                )
+                result = BehavioralRegressionRunner(simulation_plugins).run(suite, rebuilt)
+                return (
+                    RegressionOutcome(
+                        suite_id=suite.id,
+                        passed=result.passed,
+                        case_ids=tuple(item.case_id for item in result.case_results),
+                        failed_case_ids=tuple(
+                            item.case_id for item in result.case_results if not item.passed
+                        ),
+                        digest=result.digest,
+                    ),
+                )
+
+            orchestrator = ProposalOrchestrator(
+                SemanticPatchExecutor(gateway),
+                adapter.snapshot,
+                run_regressions=run_referenced,
+            )
+            record = orchestrator.execute(
+                record,
+                snapshot,
+                dry_run=args.command == "dry-run-proposal",
+                actor=args.actor,
+            )
+            store.save_proposal(record)
+        _emit_model(record, args.output)
+        return
+
+    if args.command == "promote-precedent":
+        with PlayTraceStore(args.db) as store:
+            record = store.load_proposal(args.proposal_id)
+            if record is None:
+                raise SystemExit(f"proposal {args.proposal_id!r} was not found")
+        manifest = load_manifest(args.project / "playtrace.toml")
+        if manifest.project_id != record.proposal.project_id:
+            raise SystemExit("proposal project does not match the target game repository")
+        precedent, path = promote_applied_proposal(
+            record,
+            game_root=args.project,
+            decision=args.decision,
+            rationale=args.rationale,
+            consequences=args.consequence,
+        )
+        print(json.dumps({"precedent": precedent.model_dump(mode="json"), "path": str(path)}, indent=2, default=str))
+        return
+
+    if args.command == "run-regressions":
+        suite = _load_model(args.suite, BehavioralRegressionSuite)
+        snapshot = _load_model(args.snapshot, DesignSnapshot, "snapshot")
+        with PlayTraceStore(args.db) as store:
+            verified_cases = tuple(
+                store.validate_regression_case(case) for case in suite.cases
+            )
+            verified_suite = suite.model_copy(update={"cases": verified_cases})
+            result = BehavioralRegressionRunner(simulation_plugins).run(
+                verified_suite, snapshot
+            )
+            for case in verified_cases:
+                store.save_regression_case(case)
+            store.save_regression_run(result)
+        _emit_model(result, args.output)
+        return
+
+    if args.command == "accept-regression-case":
+        case = _load_model(args.case, BehavioralRegressionCase)
+        with PlayTraceStore(args.db) as store:
+            if case.kind is RegressionCaseKind.APPROVED_BEHAVIOR:
+                if not args.proposal_id:
+                    raise SystemExit(
+                        "approved behavior acceptance requires --proposal-id"
+                    )
+            elif args.proposal_id:
+                raise SystemExit("adversarial cases do not accept --proposal-id")
+            accepted = store.accept_regression_case(
+                case,
+                actor=args.actor,
+                rationale=args.rationale,
+                proposal_id=args.proposal_id,
+            )
+        _emit_model(accepted, args.output)
+        return
+
+    if args.command == "propose-extension":
+        proposal = _load_model(args.proposal, GeneratedExtensionProposal)
+        if proposal.state.value != "proposed":
+            raise SystemExit("propose-extension only accepts a newly proposed inert record")
+        with PlayTraceStore(args.db) as store:
+            store.save_extension_proposal(proposal)
+        _emit_model(proposal, args.output)
+        return
+
+    if args.command in {"submit-extension", "decide-extension"}:
+        with PlayTraceStore(args.db) as store:
+            proposal = store.load_extension_proposal(args.proposal_id)
+            if proposal is None:
+                raise SystemExit(f"extension proposal {args.proposal_id!r} was not found")
+            target = (
+                ExtensionProposalState.PENDING
+                if args.command == "submit-extension"
+                else ExtensionProposalState(args.state)
+            )
+            proposal = transition_extension(
+                proposal, target, actor=args.actor, rationale=args.rationale
+            )
+            store.save_extension_proposal(proposal)
+        _emit_model(proposal, args.output)
+        return
     if args.command == "review":
         serve(args.host, args.port, args.file)
         return
@@ -367,6 +668,18 @@ def main() -> None:
             for evidence_item in review_bundle.experiment_evidence:
                 store.save_experiment_evidence(evidence_item)
             store.save_review(review_bundle)
+            payload["proposals"] = [
+                item.model_dump(mode="json")
+                for item in store.list_proposals(snapshot.project_id)
+            ]
+            payload["regression_runs"] = [
+                item.model_dump(mode="json")
+                for item in store.list_regression_runs(snapshot.project_id)
+            ]
+            payload["extension_proposals"] = [
+                item.model_dump(mode="json")
+                for item in store.list_extension_proposals(snapshot.project_id)
+            ]
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
         print(json.dumps(payload, indent=2, default=str))
@@ -458,6 +771,37 @@ def _workspace_gateway(args: argparse.Namespace) -> WorkspaceGateway:
             f"environment variable {args.access_token_env!r} is empty or unset"
         )
     return GoogleWorkspaceGateway(access_token)
+
+
+def _proposal_transition_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--proposal-id", required=True)
+    parser.add_argument("--db", type=Path, required=True)
+    parser.add_argument("--actor", required=True)
+    parser.add_argument("--rationale", required=True)
+    parser.add_argument("--output", type=Path)
+
+
+def _proposal_action_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--proposal-id", required=True)
+    parser.add_argument("--db", type=Path, required=True)
+    parser.add_argument("--actor", required=True)
+    parser.add_argument("--output", type=Path)
+
+
+def _extension_transition_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--proposal-id", required=True)
+    parser.add_argument("--db", type=Path, required=True)
+    parser.add_argument("--actor", required=True)
+    parser.add_argument("--rationale", required=True)
+    parser.add_argument("--output", type=Path)
+
+
+def _emit_model(model: object, output: Path | None) -> None:
+    rendered = model.model_dump_json(indent=2)  # type: ignore[attr-defined]
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(rendered + "\n", encoding="utf-8")
+    print(rendered)
 
 
 def _parse_seeds(value: str) -> tuple[int, ...]:

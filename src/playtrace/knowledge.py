@@ -6,11 +6,14 @@ import json
 import re
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 from pydantic import Field, model_validator
 
 from playtrace.models import DecisionState, StrictModel
+
+if TYPE_CHECKING:
+    from playtrace.proposals import ProposalRecord
 
 
 class PolicyLayer(StrEnum):
@@ -102,6 +105,7 @@ class PrecedentCase(StrictModel):
     scope: KnowledgeScope = Field(default_factory=KnowledgeScope)
     state: DecisionState = DecisionState.PROPOSED
     source: str
+    source_proposal_id: str | None = None
 
     @model_validator(mode="after")
     def require_meaningful_alternatives(self) -> "PrecedentCase":
@@ -252,6 +256,69 @@ def load_knowledge(shared_root: str | Path, game_root: str | Path) -> KnowledgeB
         precedents=tuple(precedents),
         experiential_evidence=tuple(evidence),
     )
+
+
+def promote_applied_proposal(
+    record: "ProposalRecord",
+    *,
+    game_root: str | Path,
+    decision: str,
+    rationale: str,
+    consequences: Iterable[str] = (),
+) -> tuple[PrecedentCase, Path]:
+    """Explicitly write one applied decision into its owning game's case library."""
+
+    from playtrace.proposals import AttemptStatus, ProposalState
+
+    proposal = record.proposal
+    if proposal.state is not ProposalState.APPLIED:
+        raise ValueError("only an applied proposal may become precedent")
+    if not any(
+        attempt.status is AttemptStatus.APPLIED and not attempt.dry_run
+        for attempt in record.attempts
+    ):
+        raise ValueError(
+            "precedent promotion requires a successful canonical application attempt"
+        )
+    if proposal.basis_digest != proposal.approval_digest():
+        raise ValueError("proposal content does not match its approved basis digest")
+    root = Path(game_root).resolve()
+    destination = (root / "design" / "cases" / f"{_safe_name(proposal.id)}.json").resolve()
+    if root not in destination.parents:
+        raise ValueError("precedent destination must remain inside the game repository")
+    precedent = PrecedentCase(
+        id=f"precedent:{proposal.id}",
+        title=proposal.title,
+        project_id=proposal.project_id,
+        snapshot_id=proposal.basis.snapshot.id,
+        question=proposal.question,
+        relevant_intent_ids=(proposal.change_set.intent_id,),
+        policy_ids=proposal.policy_ids,
+        alternatives=proposal.alternatives,
+        criteria=proposal.criteria,
+        evidence_for=proposal.evidence_ids,
+        decision=decision,
+        rationale=rationale,
+        consequences=tuple(consequences),
+        scope=KnowledgeScope(project_ids=(proposal.project_id,)),
+        state=DecisionState.ACCEPTED,
+        source=str(destination),
+        source_proposal_id=proposal.id,
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with destination.open("x", encoding="utf-8") as output:
+            output.write(precedent.model_dump_json(indent=2) + "\n")
+    except FileExistsError as error:
+        raise ValueError(f"precedent already exists: {destination}") from error
+    return precedent, destination
+
+
+def _safe_name(value: str) -> str:
+    name = re.sub(r"[^a-zA-Z0-9._-]+", "-", value).strip("-.")
+    if not name:
+        raise ValueError("proposal ID cannot produce an empty precedent filename")
+    return name
 
 
 def _load_records(root: Path, model: type[StrictModel]) -> list[Any]:
