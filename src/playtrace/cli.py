@@ -48,7 +48,7 @@ from playtrace.extensions import (
     GeneratedExtensionProposal,
     transition_extension,
 )
-from playtrace.patches import SemanticPatchExecutor
+from playtrace.patches import SemanticPatchExecutor, WriteSagaJournal
 from playtrace.proposals import (
     ProposalOrchestrator,
     ProposalRecord,
@@ -83,6 +83,13 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--host", default="127.0.0.1")
     review.add_argument("--port", type=int, default=8765)
     review.add_argument("--file", type=Path, help="serve a generated review payload")
+
+    recover = subparsers.add_parser("recover", help="retry reverse compensation for a write saga")
+    recover.add_argument("--saga-id", required=True)
+    recover.add_argument("--db", type=Path, required=True)
+    recover.add_argument("--access-token-env", metavar="ENV_VAR", required=True)
+    recover.set_defaults(fixture=None)
+    recover.add_argument("--output", type=Path)
 
     snapshot = subparsers.add_parser(
         "snapshot", help="build a tabletop snapshot from a game repository"
@@ -293,6 +300,17 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
 
+    if args.command == "recover":
+        gateway = _workspace_gateway(args)
+        with PlayTraceStore(args.db) as store:
+            saga = SemanticPatchExecutor(
+                gateway, saga_journal=WriteSagaJournal(store.connection)
+            ).recover(args.saga_id)
+        _emit_model(saga, args.output)
+        if saga.status.value == "recovery_failed":
+            raise SystemExit(2)
+        return
+
     if args.command == "propose":
         record = _load_model(args.record, ProposalRecord)
         with PlayTraceStore(args.db) as store:
@@ -393,7 +411,14 @@ def main() -> None:
                 )
 
             orchestrator = ProposalOrchestrator(
-                SemanticPatchExecutor(gateway),
+                SemanticPatchExecutor(
+                    gateway,
+                    saga_journal=(
+                        WriteSagaJournal(store.connection)
+                        if args.command == "apply-proposal"
+                        else None
+                    ),
+                ),
                 adapter.snapshot,
                 run_regressions=run_referenced,
             )

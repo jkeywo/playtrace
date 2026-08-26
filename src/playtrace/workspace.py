@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any, Protocol
 
 
+class WorkspaceConcurrencyError(RuntimeError):
+    """A workspace provider cannot safely satisfy a compare-and-write request."""
+
+
 class WorkspaceGateway(Protocol):
     supports_canonical_writes: bool
 
@@ -31,6 +35,13 @@ class WorkspaceGateway(Protocol):
         self,
         file_id: str,
         data: list[dict[str, Any]],
+    ) -> dict[str, Any]: ...
+
+    def compare_and_batch_update_sheet_values(
+        self,
+        file_id: str,
+        data: list[dict[str, Any]],
+        expected_data: list[dict[str, Any]],
     ) -> dict[str, Any]: ...
 
 
@@ -119,6 +130,25 @@ class GoogleWorkspaceGateway:
             body={"valueInputOption": "RAW", "data": data},
         )
 
+    def compare_and_batch_update_sheet_values(
+        self,
+        file_id: str,
+        data: list[dict[str, Any]],
+        expected_data: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Fail closed because Sheets values writes have no compare-and-write guard.
+
+        The Sheets v4 values batch-update endpoint cannot condition a mutation on
+        the values or Drive version previously observed. Re-reading before the
+        request merely narrows the race window, so it is deliberately not treated
+        as optimistic concurrency.
+        """
+
+        del file_id, data, expected_data
+        raise WorkspaceConcurrencyError(
+            "Google Sheets values writes do not provide an atomic compare-and-write guard"
+        )
+
     def _request(
         self,
         method: str,
@@ -195,3 +225,24 @@ class FixtureWorkspaceGateway:
         write = {"kind": "sheet", "file_id": file_id, "data": data}
         self.writes.append(write)
         return write
+
+    def compare_and_batch_update_sheet_values(
+        self,
+        file_id: str,
+        data: list[dict[str, Any]],
+        expected_data: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Deterministic fixture implementation of the atomic provider contract."""
+
+        available = self.payload["spreadsheets"][file_id].get("ranges", {})
+        for expected in expected_data:
+            range_name = str(expected["range"])
+            actual = tuple(tuple(row) for row in available.get(range_name, []))
+            wanted = tuple(tuple(row) for row in expected.get("values", []))
+            if actual != wanted:
+                raise WorkspaceConcurrencyError(
+                    f"sheet values changed before compare-and-write in {range_name}"
+                )
+        # Fixture transports are single-threaded. This call represents the
+        # provider-side atomic mutation after all predicates passed.
+        return self.batch_update_sheet_values(file_id, data)

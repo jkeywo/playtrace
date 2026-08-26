@@ -169,6 +169,14 @@ CREATE TABLE IF NOT EXISTS identity_metadata (
     value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS write_sagas (
+    id TEXT PRIMARY KEY,
+    proposal_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
     record_id UNINDEXED,
     record_type UNINDEXED,

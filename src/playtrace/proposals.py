@@ -15,7 +15,13 @@ from playtrace.canonical import (
     canonical_digest,
 )
 from playtrace.models import ChangeSet, DecisionState, DesignSnapshot, StrictModel
-from playtrace.patches import SemanticPatchExecutor, SemanticPatchSet
+from playtrace.patches import (
+    SagaExecutionError,
+    SagaStatus,
+    SemanticPatchExecutor,
+    SemanticPatchSet,
+    WriteSaga,
+)
 from playtrace.simulation import snapshot_content_digest
 
 
@@ -237,6 +243,9 @@ class ApplicationAttempt(StrictModel):
     failed_postconditions: tuple[str, ...] = ()
     regressions: tuple[RegressionOutcome, ...] = ()
     message: str | None = None
+    write_saga_id: str | None = None
+    recovery_required: bool = False
+    partial_failures: tuple[str, ...] = ()
     occurred_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     @model_validator(mode="after")
@@ -440,6 +449,13 @@ class ProposalOrchestrator:
                 dry_run=dry_run,
                 message="Preflight failed: proposal content no longer matches its approval digest.",
             )
+        attempt_id = f"{proposal.id}:attempt:{len(record.attempts) + 1}"
+        if not dry_run and self.patch_executor.saga_journal is not None:
+            existing = self.patch_executor.saga_journal.load(f"{attempt_id}:saga")
+            if existing is not None:
+                return self._reconcile_durable_saga(
+                    record, existing, attempt_id=attempt_id, actor=actor
+                )
         if current_snapshot.id != proposal.basis.snapshot.id:
             return _append_preflight_failure(
                 record,
@@ -467,7 +483,6 @@ class ProposalOrchestrator:
                 ),
             )
 
-        attempt_id = f"{proposal.id}:attempt:{len(record.attempts) + 1}"
         try:
             preflight = self.patch_executor.execute(proposal.patch_set, dry_run=True)
         except Exception as error:
@@ -501,7 +516,36 @@ class ProposalOrchestrator:
             )
 
         try:
-            write_result = self.patch_executor.execute(proposal.patch_set, dry_run=False)
+            write_result = self.patch_executor.execute_transactional(
+                proposal.patch_set,
+                proposal_id=proposal.id,
+                attempt_id=attempt_id,
+            )
+        except SagaExecutionError as error:
+            saga = error.saga
+            attempt = ApplicationAttempt(
+                id=attempt_id,
+                proposal_id=proposal.id,
+                basis_digest=proposal.basis_digest,
+                actor=actor,
+                dry_run=False,
+                status=AttemptStatus.WRITE_FAILED,
+                checked_operations=preflight.checked_operations,
+                applied_operations=self.patch_executor.applied_semantic_operation_count(
+                    saga.operations
+                ),
+                write_saga_id=saga.id,
+                recovery_required=saga.status.value == "recovery_failed",
+                partial_failures=saga.failures,
+                message=(
+                    "Canonical write saga failed. Reverse compensation was verified."
+                    if saga.status.value == "recovered"
+                    else "Canonical write saga failed and exact recovery remains required."
+                ),
+            )
+            return _append_attempt_state(
+                record, attempt, ProposalState.WRITE_FAILED, actor, "Canonical write failed."
+            )
         except Exception as error:
             attempt = ApplicationAttempt(
                 id=attempt_id,
@@ -521,6 +565,8 @@ class ProposalOrchestrator:
             )
 
         try:
+            if write_result.write_saga_id:
+                self.patch_executor.begin_validation(write_result.write_saga_id)
             rebuilt = self.rebuild_snapshot()
             failures = tuple(self.validate_postconditions(proposal, rebuilt))
             regressions = tuple(self.run_regressions(proposal, rebuilt))
@@ -549,6 +595,31 @@ class ProposalOrchestrator:
             regressions = ()
             failures = (f"post-write validation crashed: {error}",)
 
+        recovery_required = False
+        partial_failures: tuple[str, ...] = ()
+        if failures and write_result.write_saga_id:
+            try:
+                rollback = self.patch_executor.rollback(write_result.write_saga_id)
+                recovery_required = rollback.status.value == "recovery_failed"
+                partial_failures = rollback.failures
+            except Exception as error:
+                recovery_required = True
+                partial_failures = (f"validation rollback crashed: {error}",)
+        elif failures:
+            recovery_required = True
+            partial_failures = ("write executor did not provide a durable saga",)
+        elif write_result.write_saga_id:
+            try:
+                self.patch_executor.commit(write_result.write_saga_id)
+            except Exception as error:
+                failures = (f"write saga commit failed: {error}",)
+                try:
+                    rollback = self.patch_executor.rollback(write_result.write_saga_id)
+                    recovery_required = rollback.status.value == "recovery_failed"
+                    partial_failures = rollback.failures
+                except Exception as rollback_error:
+                    recovery_required = True
+                    partial_failures = (f"commit rollback crashed: {rollback_error}",)
         status = AttemptStatus.VALIDATION_FAILED if failures else AttemptStatus.APPLIED
         state = ProposalState.VALIDATION_FAILED if failures else ProposalState.APPLIED
         attempt = ApplicationAttempt(
@@ -564,14 +635,106 @@ class ProposalOrchestrator:
             rebuilt_snapshot_digest=snapshot_content_digest(rebuilt) if rebuilt else None,
             failed_postconditions=tuple(failures),
             regressions=regressions,
+            write_saga_id=write_result.write_saga_id,
+            recovery_required=recovery_required,
+            partial_failures=partial_failures,
             message=(
-                "Canonical writes completed, but validation failed; canon was not rolled back."
+                (
+                    "Canonical writes completed, but validation failed; canon was not rolled back."
+                    if not write_result.write_saga_id
+                    else (
+                        "Canonical writes completed, validation failed, and reverse compensation was verified."
+                        if not recovery_required
+                        else "Canonical writes completed, validation failed, and exact recovery remains required."
+                    )
+                )
                 if failures
                 else "Canonical writes and all post-apply validation completed."
             ),
         )
         rationale = "Post-write validation failed." if failures else "Applied and validated."
         return _append_attempt_state(record, attempt, state, actor, rationale)
+
+    def _reconcile_durable_saga(
+        self,
+        record: ProposalRecord,
+        saga: WriteSaga,
+        *,
+        attempt_id: str,
+        actor: str,
+    ) -> ProposalRecord:
+        """Project a durable saga whose proposal attempt was lost in a crash."""
+
+        proposal = record.proposal
+        if (
+            saga.id != f"{attempt_id}:saga"
+            or saga.attempt_id != attempt_id
+            or saga.proposal_id != proposal.id
+            or saga.patch_set_id != proposal.patch_set.id
+        ):
+            return _append_preflight_failure(
+                record,
+                actor=actor,
+                dry_run=False,
+                message="Preflight failed: durable write saga identity does not match the proposal.",
+            )
+
+        checked = len(proposal.patch_set.document_patches) + len(
+            proposal.patch_set.sheet_patches
+        )
+        applied = self.patch_executor.applied_semantic_operation_count(saga.operations)
+        if saga.status is SagaStatus.COMMITTED:
+            attempt = ApplicationAttempt(
+                id=attempt_id,
+                proposal_id=proposal.id,
+                basis_digest=proposal.basis_digest,
+                actor=actor,
+                dry_run=False,
+                status=AttemptStatus.APPLIED,
+                checked_operations=checked,
+                applied_operations=applied,
+                write_saga_id=saga.id,
+                message=(
+                    "Reconciled a durably committed canonical write whose proposal "
+                    "attempt record was interrupted."
+                ),
+            )
+            return _append_attempt_state(
+                record, attempt, ProposalState.APPLIED, actor, "Reconciled durable commit."
+            )
+
+        if saga.status is not SagaStatus.RECOVERED:
+            try:
+                saga = self.patch_executor.recover(saga.id)
+            except Exception as error:
+                saga = saga.model_copy(
+                    update={
+                        "status": SagaStatus.RECOVERY_FAILED,
+                        "failures": (*saga.failures, f"reconciliation recovery crashed: {error}"),
+                    }
+                )
+        recovery_required = saga.status is not SagaStatus.RECOVERED
+        attempt = ApplicationAttempt(
+            id=attempt_id,
+            proposal_id=proposal.id,
+            basis_digest=proposal.basis_digest,
+            actor=actor,
+            dry_run=False,
+            status=AttemptStatus.WRITE_FAILED,
+            checked_operations=checked,
+            applied_operations=applied,
+            write_saga_id=saga.id,
+            recovery_required=recovery_required,
+            partial_failures=saga.failures,
+            message=(
+                "Reconciled an interrupted canonical write and verified reverse compensation."
+                if not recovery_required
+                else "Reconciled an interrupted canonical write; exact recovery remains required."
+            ),
+        )
+        return _append_attempt_state(
+            record, attempt, ProposalState.WRITE_FAILED, actor, "Reconciled interrupted write."
+        )
 
 
 def _append_preflight_failure(

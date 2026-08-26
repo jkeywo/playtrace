@@ -37,6 +37,69 @@ class DocumentRecords:
     cnl_lines: tuple[str, ...]
 
 
+def utf16_code_unit_length(text: str) -> int:
+    """Return the number of UTF-16 code units used by Google Docs indices.
+
+    Google Docs ranges are not Python string offsets: non-BMP characters occupy
+    two provider indices.  Lone surrogate code points are rejected because they
+    cannot represent valid document text safely.
+    """
+
+    units = 0
+    for character in text:
+        value = ord(character)
+        if 0xD800 <= value <= 0xDFFF:
+            raise ValueError("document text contains an unpaired UTF-16 surrogate")
+        units += 2 if value > 0xFFFF else 1
+    return units
+
+
+def python_offset_to_utf16_index(text: str, offset: int) -> int:
+    """Translate a Python character offset to a UTF-16 code-unit offset."""
+
+    if offset < 0 or offset > len(text):
+        raise ValueError("Python text offset is outside the string")
+    return utf16_code_unit_length(text[:offset])
+
+
+def utf16_index_to_python_offset(text: str, index: int) -> int:
+    """Translate a UTF-16 code-unit offset to an exact Python boundary."""
+
+    if index < 0:
+        raise ValueError("UTF-16 text index cannot be negative")
+    units = 0
+    for offset, character in enumerate(text):
+        value = ord(character)
+        if 0xD800 <= value <= 0xDFFF:
+            raise ValueError("document text contains an unpaired UTF-16 surrogate")
+        if units == index:
+            return offset
+        width = 2 if value > 0xFFFF else 1
+        if units < index < units + width:
+            raise ValueError("UTF-16 text index splits a surrogate pair")
+        units += width
+    if units == index:
+        return len(text)
+    raise ValueError("UTF-16 text index is outside the string")
+
+
+def replace_text_in_utf16_range(text: str, start_index: int, end_index: int, value: str) -> str:
+    """Replace an exact UTF-16 range in a Python string."""
+
+    start = utf16_index_to_python_offset(text, start_index)
+    end = utf16_index_to_python_offset(text, end_index)
+    return text[:start] + value + text[end:]
+
+
+def document_tab_text_bounds(document: dict[str, Any], tab_id: str) -> tuple[int, int]:
+    """Return the exact provider-index extent occupied by text in one tab."""
+
+    runs = _document_tab_text_runs(document, tab_id)
+    if not runs:
+        raise ValueError(f"Google Docs tab {tab_id!r} has no text ranges")
+    return runs[0][0], runs[-1][1]
+
+
 def extract_document_records(
     document: dict[str, Any],
     source_id: str,
@@ -67,7 +130,7 @@ def extract_document_records(
             if not text.strip():
                 continue
             start = int(structural.get("startIndex", 0))
-            end = int(structural.get("endIndex", start + len(text)))
+            end = int(structural.get("endIndex", start + utf16_code_unit_length(text)))
             named_style = paragraph.get("paragraphStyle", {}).get("namedStyleType", "NORMAL_TEXT")
             explicit_match = STABLE_ID_PATTERN.search(text)
             if explicit_match:
@@ -137,22 +200,69 @@ def extract_document_records(
 def text_in_document_range(
     document: dict[str, Any], tab_id: str, start_index: int, end_index: int
 ) -> str:
+    if start_index < 0 or end_index < start_index:
+        raise ValueError("invalid Google Docs UTF-16 range")
+    runs = _document_tab_text_runs(document, tab_id)
+    if not runs:
+        raise ValueError(f"Google Docs tab {tab_id!r} has no text ranges")
+
+    if start_index == end_index:
+        if not any(start <= start_index <= end for start, end, _ in runs):
+            raise ValueError("Google Docs UTF-16 range is outside the tab text")
+        for element_start, element_end, text in runs:
+            if element_start <= start_index <= element_end:
+                utf16_index_to_python_offset(text, start_index - element_start)
+                return ""
+
     chunks: list[str] = []
+    cursor = start_index
+    for element_start, element_end, text in runs:
+        overlap_start = max(start_index, element_start)
+        overlap_end = min(end_index, element_end)
+        if overlap_start >= overlap_end:
+            continue
+        if overlap_start != cursor:
+            raise ValueError("Google Docs UTF-16 range crosses a non-text boundary")
+        relative_start = utf16_index_to_python_offset(text, overlap_start - element_start)
+        relative_end = utf16_index_to_python_offset(text, overlap_end - element_start)
+        chunks.append(text[relative_start:relative_end])
+        cursor = overlap_end
+    if cursor != end_index:
+        raise ValueError("Google Docs UTF-16 range is outside the tab text")
+    return "".join(chunks)
+
+
+def _document_tab_text_runs(
+    document: dict[str, Any], tab_id: str
+) -> tuple[tuple[int, int, str], ...]:
     tabs = document.get("tabs") or []
+    matches = []
     for tab in tabs:
         properties = tab.get("tabProperties", tab)
-        if properties.get("tabId", tab.get("tabId")) != tab_id:
-            continue
-        for structural in (tab.get("body") or {}).get("content", []):
-            for element in structural.get("paragraph", {}).get("elements", []):
-                text = element.get("textRun", {}).get("content", "")
-                element_start = int(element.get("startIndex", structural.get("startIndex", 0)))
-                element_end = int(element.get("endIndex", element_start + len(text)))
-                overlap_start = max(start_index, element_start)
-                overlap_end = min(end_index, element_end)
-                if overlap_start < overlap_end:
-                    chunks.append(text[overlap_start - element_start : overlap_end - element_start])
-    return "".join(chunks)
+        if properties.get("tabId", tab.get("tabId")) == tab_id:
+            matches.append(tab)
+    if len(matches) != 1:
+        if not matches:
+            raise ValueError(f"Google Docs tab {tab_id!r} was not found")
+        raise ValueError(f"Google Docs tab {tab_id!r} is ambiguous")
+
+    runs: list[tuple[int, int, str]] = []
+    for structural in (matches[0].get("body") or {}).get("content", []):
+        for element in structural.get("paragraph", {}).get("elements", []):
+            text = element.get("textRun", {}).get("content", "")
+            if not text:
+                continue
+            element_start = int(element.get("startIndex", structural.get("startIndex", 0)))
+            text_end = element_start + utf16_code_unit_length(text)
+            element_end = int(element.get("endIndex", text_end))
+            if element_end != text_end:
+                raise ValueError("Google Docs textRun extent does not match its UTF-16 text")
+            runs.append((element_start, element_end, text))
+    runs.sort(key=lambda item: (item[0], item[1]))
+    for previous, current in zip(runs, runs[1:]):
+        if current[0] < previous[1]:
+            raise ValueError("Google Docs tab contains overlapping text ranges")
+    return tuple(runs)
 
 
 def _paragraph_fixture_to_content(paragraphs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -173,4 +283,3 @@ def _paragraph_fixture_to_content(paragraphs: list[dict[str, Any]]) -> list[dict
         }
         for item in paragraphs
     ]
-

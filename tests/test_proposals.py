@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from playtrace.adapters import SyntheticProjectAdapter
+from playtrace.docs_adapter import replace_text_in_utf16_range, utf16_code_unit_length
 from playtrace.knowledge import promote_applied_proposal
 from playtrace.models import (
     ChangeOperation,
@@ -10,7 +13,12 @@ from playtrace.models import (
     DecisionState,
     SourceMedium,
 )
-from playtrace.patches import DocumentTextPatch, SemanticPatchExecutor, SemanticPatchSet
+from playtrace.patches import (
+    DocumentTextPatch,
+    SemanticPatchExecutor,
+    SemanticPatchSet,
+    WriteSagaJournal,
+)
 from playtrace.proposals import (
     AttemptStatus,
     ProposalBasis,
@@ -22,7 +30,7 @@ from playtrace.proposals import (
     create_proposal,
     transition_proposal,
 )
-from playtrace.storage import PlayTraceStore
+from playtrace.storage import PlayTraceStore, SCHEMA
 from playtrace.workspace import FixtureWorkspaceGateway
 
 
@@ -30,6 +38,38 @@ class WritableTestGateway(FixtureWorkspaceGateway):
     """Unit-test double for the live-writable gateway contract."""
 
     supports_canonical_writes = True
+
+    def batch_update_document(self, file_id, requests, required_revision_id):
+        document = self.payload["documents"][file_id]
+        assert document["revisionId"] == required_revision_id
+        element = document["tabs"][0]["body"]["content"][0]["paragraph"]["elements"][0]
+        base = int(element["startIndex"])
+        text = element["textRun"]["content"]
+        for request in requests:
+            if "deleteContentRange" in request:
+                target = request["deleteContentRange"]["range"]
+                text = replace_text_in_utf16_range(
+                    text, int(target["startIndex"]) - base, int(target["endIndex"]) - base, ""
+                )
+            else:
+                insertion = request["insertText"]
+                text = replace_text_in_utf16_range(
+                    text,
+                    int(insertion["location"]["index"]) - base,
+                    int(insertion["location"]["index"]) - base,
+                    str(insertion["text"]),
+                )
+        element["textRun"]["content"] = text
+        element["endIndex"] = base + utf16_code_unit_length(text)
+        document["revisionId"] = f"{required_revision_id}:next"
+        return super().batch_update_document(file_id, requests, required_revision_id)
+
+
+def _executor(gateway: WritableTestGateway) -> SemanticPatchExecutor:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.executescript(SCHEMA)
+    return SemanticPatchExecutor(gateway, saga_journal=WriteSagaJournal(connection))
 
 
 def test_proposal_binds_full_basis_and_history_is_append_only(tmp_path) -> None:
@@ -60,7 +100,7 @@ def test_proposal_binds_full_basis_and_history_is_append_only(tmp_path) -> None:
 
 def test_only_approved_proposal_can_preflight_or_apply_and_dry_run_never_writes() -> None:
     record, gateway, snapshot = _record()
-    orchestrator = ProposalOrchestrator(SemanticPatchExecutor(gateway), lambda: snapshot)
+    orchestrator = ProposalOrchestrator(_executor(gateway), lambda: snapshot)
     refused = orchestrator.execute(record, snapshot, dry_run=True, actor="operator")
     assert refused.attempts[-1].status is AttemptStatus.PREFLIGHT_FAILED
     assert "only an approved" in refused.attempts[-1].message
@@ -98,7 +138,7 @@ def test_preflight_failure_is_persistable_and_performs_no_write() -> None:
         evidence_ids=record.proposal.evidence_ids,
     )
     checked = ProposalOrchestrator(
-        SemanticPatchExecutor(gateway), lambda: snapshot
+        _executor(gateway), lambda: snapshot
     ).execute(_approve(proposal), snapshot, dry_run=False, actor="operator")
 
     assert gateway.writes == []
@@ -111,7 +151,7 @@ def test_apply_rechecks_basis_writes_then_validates() -> None:
     record, gateway, snapshot = _record()
     approved = _approve(record)
     applied = ProposalOrchestrator(
-        SemanticPatchExecutor(gateway), lambda: snapshot
+        _executor(gateway), lambda: snapshot
     ).execute(approved, snapshot, dry_run=False, actor="operator")
 
     assert len(gateway.writes) == 1
@@ -121,7 +161,7 @@ def test_apply_rechecks_basis_writes_then_validates() -> None:
 
     changed = snapshot.model_copy(update={"id": "another-snapshot"})
     stale = ProposalOrchestrator(
-        SemanticPatchExecutor(gateway), lambda: snapshot
+        _executor(gateway), lambda: snapshot
     ).execute(approved, changed, dry_run=True, actor="operator")
     assert stale.attempts[-1].status is AttemptStatus.PREFLIGHT_FAILED
     assert "snapshot ID" in stale.attempts[-1].message
@@ -129,7 +169,7 @@ def test_apply_rechecks_basis_writes_then_validates() -> None:
     tampered_proposal = approved.proposal.model_copy(update={"title": "Unapproved title"})
     tampered = approved.model_copy(update={"proposal": tampered_proposal})
     refused = ProposalOrchestrator(
-        SemanticPatchExecutor(gateway), lambda: snapshot
+        _executor(gateway), lambda: snapshot
     ).execute(tampered, snapshot, dry_run=True, actor="operator")
     assert refused.attempts[-1].status is AttemptStatus.PREFLIGHT_FAILED
     assert "approval digest" in refused.attempts[-1].message
@@ -153,7 +193,7 @@ def test_snapshot_preflight_failure_round_trips_as_append_only_attempt(tmp_path)
     approved = _approve(record)
     changed = snapshot.model_copy(update={"id": "another-snapshot"})
     refused = ProposalOrchestrator(
-        SemanticPatchExecutor(gateway), lambda: snapshot
+        _executor(gateway), lambda: snapshot
     ).execute(approved, changed, dry_run=True, actor="operator")
 
     with PlayTraceStore(tmp_path / "preflight.db") as store:
@@ -172,7 +212,7 @@ def test_approval_digest_preflight_failure_persists_without_replacing_proposal(t
     tampered_proposal = approved.proposal.model_copy(update={"title": "Unapproved title"})
     tampered = approved.model_copy(update={"proposal": tampered_proposal})
     refused = ProposalOrchestrator(
-        SemanticPatchExecutor(gateway), lambda: snapshot
+        _executor(gateway), lambda: snapshot
     ).execute(tampered, snapshot, dry_run=True, actor="operator")
 
     with PlayTraceStore(tmp_path / "approval-preflight.db") as store:
@@ -198,13 +238,13 @@ def test_post_write_validation_failure_is_not_reported_as_write_failure() -> Non
         )
     )
     failed = ProposalOrchestrator(
-        SemanticPatchExecutor(gateway), lambda: snapshot
+        _executor(gateway), lambda: snapshot
     ).execute(_approve(record), snapshot, dry_run=False, actor="operator")
 
-    assert len(gateway.writes) == 1
+    assert len(gateway.writes) == 2
     assert failed.proposal.state is ProposalState.VALIDATION_FAILED
     assert failed.attempts[-1].status is AttemptStatus.VALIDATION_FAILED
-    assert "not rolled back" in failed.attempts[-1].message
+    assert "reverse compensation was verified" in failed.attempts[-1].message
 
 
 def test_write_failure_is_recorded_honestly_and_validation_does_not_run() -> None:
@@ -214,12 +254,12 @@ def test_write_failure_is_recorded_honestly_and_validation_does_not_run() -> Non
     )
     rebuilt = []
     failed = ProposalOrchestrator(
-        SemanticPatchExecutor(gateway), lambda: rebuilt.append(True) or snapshot
+        _executor(gateway), lambda: rebuilt.append(True) or snapshot
     ).execute(_approve(record), snapshot, dry_run=False, actor="operator")
 
     assert failed.proposal.state is ProposalState.WRITE_FAILED
     assert failed.attempts[-1].status is AttemptStatus.WRITE_FAILED
-    assert "partially written" in failed.attempts[-1].message
+    assert "Reverse compensation was verified" in failed.attempts[-1].message
     assert rebuilt == []
 
 
@@ -229,7 +269,7 @@ def test_every_referenced_regression_must_run_and_pass() -> None:
         regression_records={"case:known": {"id": "case:known", "expected": "won"}},
     )
     failed = ProposalOrchestrator(
-        SemanticPatchExecutor(gateway),
+        _executor(gateway),
         lambda: snapshot,
         run_regressions=lambda _proposal, _snapshot: (
             RegressionOutcome(
@@ -287,7 +327,7 @@ def test_only_applied_proposal_can_be_promoted_to_game_owned_precedent(tmp_path)
             store.save_proposal(fake_applied)
 
     applied = ProposalOrchestrator(
-        SemanticPatchExecutor(gateway), lambda: snapshot
+        _executor(gateway), lambda: snapshot
     ).execute(_approve(record), snapshot, dry_run=False, actor="operator")
     precedent, path = promote_applied_proposal(
         applied,

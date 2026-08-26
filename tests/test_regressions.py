@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
+from playtrace.docs_adapter import replace_text_in_utf16_range, utf16_code_unit_length
 from playtrace.models import ChangeOperation, ChangeSet, DecisionState
-from playtrace.patches import DocumentTextPatch, SemanticPatchExecutor, SemanticPatchSet
+from playtrace.patches import (
+    DocumentTextPatch,
+    SemanticPatchExecutor,
+    SemanticPatchSet,
+    WriteSagaJournal,
+)
 from playtrace.plugins.crisis_wardens import CrisisWardensSimulationPlugin
 from playtrace.proposals import (
     ProposalBasis,
@@ -22,7 +30,7 @@ from playtrace.regressions import (
     stable_run_digest,
 )
 from playtrace.simulation import InProcessSimulationRunner, SimulationConfig, snapshot_content_digest
-from playtrace.storage import PlayTraceStore
+from playtrace.storage import PlayTraceStore, SCHEMA
 from playtrace.workspace import FixtureWorkspaceGateway
 from test_simulation import _snapshot
 
@@ -194,6 +202,36 @@ def _case(id, kind, snapshot, config, expectation, rationale="Protect a known be
 class _WritableGateway(FixtureWorkspaceGateway):
     supports_canonical_writes = True
 
+    def batch_update_document(self, file_id, requests, required_revision_id):
+        document = self.payload["documents"][file_id]
+        assert document["revisionId"] == required_revision_id
+        element = document["tabs"][0]["body"]["content"][0]["paragraph"]["elements"][0]
+        base = int(element["startIndex"])
+        text = element["textRun"]["content"]
+        for request in requests:
+            if "deleteContentRange" in request:
+                target = request["deleteContentRange"]["range"]
+                text = replace_text_in_utf16_range(
+                    text, int(target["startIndex"]) - base, int(target["endIndex"]) - base, ""
+                )
+            else:
+                insertion = request["insertText"]
+                relative = int(insertion["location"]["index"]) - base
+                text = replace_text_in_utf16_range(
+                    text, relative, relative, str(insertion["text"])
+                )
+        element["textRun"]["content"] = text
+        element["endIndex"] = base + utf16_code_unit_length(text)
+        document["revisionId"] = f"{required_revision_id}:next"
+        return super().batch_update_document(file_id, requests, required_revision_id)
+
+
+def _executor(gateway):
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.executescript(SCHEMA)
+    return SemanticPatchExecutor(gateway, saga_journal=WriteSagaJournal(connection))
+
 
 def _applied_record(snapshot):
     return _proposal_lifecycle(snapshot)[2]
@@ -290,7 +328,7 @@ def _proposal_lifecycle(snapshot):
         }
     )
     applied = ProposalOrchestrator(
-        SemanticPatchExecutor(gateway), lambda: snapshot
+        _executor(gateway), lambda: snapshot
     ).execute(approved, snapshot, dry_run=False, actor="operator")
     assert applied.proposal.state is ProposalState.APPLIED
     return initial, approved, applied
