@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from playtrace.adapters import SyntheticProjectAdapter
 from playtrace.analysis import SnapshotAnalyzer
 from playtrace.demo import build_demo_review
@@ -25,12 +27,14 @@ from playtrace.reviewing import (
     ReviewDecisionState,
 )
 from playtrace.review_server import serve
-from playtrace.plugins.crisis_wardens import CrisisWardensSimulationPlugin
+from playtrace.plugins import registry as simulation_plugins
 from playtrace.simulation import (
     DockerSimulationRunner,
     InProcessSimulationRunner,
     SimulationConfig,
+    SimulationJsonInputError,
     SimulationRun,
+    load_bounded_json_file,
 )
 from playtrace.simulation_report import write_simulation_report
 from playtrace.tension import ABComparison, TensionBatch, build_batch, compare_batches
@@ -283,7 +287,7 @@ def main() -> None:
         snapshot = TabletopProjectAdapter.from_path(
             args.project / "playtrace.toml", gateway
         ).snapshot()
-        template = SimulationConfig.model_validate_json(args.config.read_text(encoding="utf-8"))
+        template = _load_simulation_config(args.config)
         if len(template.character_ids) < 2:
             raise SystemExit("batch config must list both current character IDs")
         combinations = (
@@ -292,7 +296,10 @@ def main() -> None:
             tuple(template.character_ids[:2]),
         )
         seeds = _parse_seeds(args.seeds)
-        plugin = CrisisWardensSimulationPlugin()
+        try:
+            plugin = simulation_plugins.for_project(snapshot.project_id)
+        except KeyError as error:
+            raise SystemExit(str(error)) from error
         runner = InProcessSimulationRunner()
         runs = []
         for characters in combinations:
@@ -370,14 +377,11 @@ def main() -> None:
         snapshot = TabletopProjectAdapter.from_path(
             args.project / "playtrace.toml", gateway
         ).snapshot()
-        if snapshot.project_id != "crisis-wardens":
-            raise SystemExit(
-                f"no simulation plugin is registered for project {snapshot.project_id!r}"
-            )
-        config = SimulationConfig.model_validate_json(
-            args.config.read_text(encoding="utf-8")
-        )
-        plugin = CrisisWardensSimulationPlugin()
+        config = _load_simulation_config(args.config)
+        try:
+            plugin = simulation_plugins.for_project(snapshot.project_id)
+        except KeyError as error:
+            raise SystemExit(str(error)) from error
         if args.runner == "docker":
             if not args.image or not args.image_digest:
                 raise SystemExit("--image and --image-digest are required for the docker runner")
@@ -398,7 +402,13 @@ def main() -> None:
             store.save_simulation(run)
             store.save_claim(snapshot.id, claim)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        rendered = json.dumps(payload, indent=2, default=str)
+        rendered = json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+        )
         output_path.write_text(rendered + "\n", encoding="utf-8")
         print(rendered)
         return
@@ -465,6 +475,16 @@ def _parse_seeds(value: str) -> tuple[int, ...]:
     if not seeds:
         raise SystemExit("at least one seed is required")
     return tuple(dict.fromkeys(seeds))
+
+
+def _load_simulation_config(path: Path) -> SimulationConfig:
+    try:
+        payload = load_bounded_json_file(path)
+        return SimulationConfig.model_validate(payload)
+    except SimulationJsonInputError as error:
+        raise SystemExit(f"invalid simulation JSON input ({error.category}): {error.message}") from error
+    except ValidationError as error:
+        raise SystemExit(f"invalid simulation configuration: {error}") from error
 
 
 def _load_model(path: Path, model: type, wrapper: str | None = None):

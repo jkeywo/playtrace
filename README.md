@@ -13,7 +13,14 @@ while a game is being discovered, not only after it has become a specification.
 
 ## Current milestone
 
-**M3: the experiment evidence loop is implemented.** Play Trace records
+**M4: the tabletop compiler and semantic strictness boundary are implemented.**
+Exact Improve, Worsen, and cube Transfer rules can execute from typed RuleIR;
+selector phrases require an explicit game-owned resolver. Plugins are resolved
+through a registry, scripted policies never invent fallback actions, and every
+new run inventories compiled, extension, provisional, and missing semantics.
+Strict runs reject the latter two categories before play.
+
+M3's experiment evidence loop records
 simulation runs, tension batches, and paired A/B comparisons as typed evidence
 linked to an explicit hypothesis. It preserves assumptions and reproducibility
 provenance, marks evidence stale when dependency revisions or digests change,
@@ -25,6 +32,7 @@ turns supported snapshot semantics into replayable traces. It emits typed
 blockers instead of inventing missing rules and links every result to an
 evidence claim with reconstructable provenance.
 
+- [M4 milestone](docs/M4.md)
 - [M3 milestone](docs/M3.md)
 - [M2 milestone](docs/M2.md)
 - [M1 milestone](docs/M1.md)

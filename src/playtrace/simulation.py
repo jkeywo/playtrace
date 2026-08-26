@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import subprocess
 import tempfile
 from datetime import UTC, datetime
@@ -11,7 +12,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
-from pydantic import Field, model_validator
+from pydantic import BaseModel, Field, JsonValue, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
 from playtrace.models import (
     DesignSnapshot,
@@ -24,6 +26,43 @@ from playtrace.models import (
 
 SIMULATION_SCHEMA_VERSION = 1
 
+# Override values cross Python, SQLite, CLI, and container JSON boundaries.  Keep
+# integers inside IEEE-754's exactly representable range so a value has the same
+# meaning in JavaScript and other common JSON consumers.  The structural limits
+# make validation total and prevent an untrusted override from consuming
+# unbounded recursion, traversal, or serialization work.
+JSON_SAFE_INTEGER_MAX = 9_007_199_254_740_991
+OVERRIDE_JSON_MAX_DEPTH = 32
+OVERRIDE_JSON_MAX_NODES = 10_000
+OVERRIDE_JSON_MAX_BYTES = 262_144
+SIMULATION_INPUT_MAX_DEPTH = 64
+SIMULATION_INPUT_MAX_NODES = 250_000
+SIMULATION_INPUT_MAX_BYTES = 16_777_216
+
+_INVALID_OVERRIDE_REASONS = {
+    "unsupported_type": "Simulation override values may contain only JSON null, booleans, numbers, strings, arrays, and string-keyed objects.",
+    "non_string_key": "Simulation override JSON objects must use string keys.",
+    "non_finite_float": "Simulation override numbers must be finite.",
+    "integer_out_of_range": (
+        "Simulation override integers must be within the interoperable JSON-safe "
+        f"range -{JSON_SAFE_INTEGER_MAX} to {JSON_SAFE_INTEGER_MAX}."
+    ),
+    "invalid_unicode": "Simulation override strings and object keys must be valid UTF-8 without unpaired surrogates.",
+    "cycle": "Simulation override arrays and objects must not contain cycles.",
+    "maximum_depth": f"Simulation override values may be at most {OVERRIDE_JSON_MAX_DEPTH} levels deep.",
+    "maximum_nodes": f"Simulation override values may contain at most {OVERRIDE_JSON_MAX_NODES} JSON nodes.",
+    "maximum_size": f"A serialized simulation override may be at most {OVERRIDE_JSON_MAX_BYTES} UTF-8 bytes.",
+}
+
+
+class SimulationJsonInputError(ValueError):
+    """A bounded JSON file failed before domain-model validation."""
+
+    def __init__(self, category: str, message: str) -> None:
+        self.category = category
+        self.message = message
+        super().__init__(f"{category}: {message}")
+
 
 class PlayerPolicyKind(StrEnum):
     PASSIVE = "passive"
@@ -31,6 +70,32 @@ class PlayerPolicyKind(StrEnum):
     RISK_AVERSE = "risk_averse"
     RANDOM_CONSTRAINED = "random_constrained"
     SCRIPTED = "scripted"
+
+
+class PlayerActionKind(StrEnum):
+    ACTIVATE_CARD = "activate_card"
+    REST = "rest"
+    PASS = "pass"
+
+
+class ScriptedPolicyStep(StrictModel):
+    """One exact player decision in a deterministic replay script."""
+
+    turn: int
+    actor_id: str
+    action: PlayerActionKind
+    card_id: str | None = None
+    target_id: str | None = None
+
+    @model_validator(mode="after")
+    def require_action_fields(self) -> "ScriptedPolicyStep":
+        if self.turn < 1:
+            raise ValueError("scripted step turn must be positive")
+        if self.action is PlayerActionKind.ACTIVATE_CARD and not self.card_id:
+            raise ValueError("activate_card scripted steps require card_id")
+        if self.action is not PlayerActionKind.ACTIVATE_CARD and self.card_id:
+            raise ValueError("only activate_card scripted steps may name card_id")
+        return self
 
 
 class SimulationStatus(StrEnum):
@@ -53,9 +118,34 @@ class BlockerKind(StrEnum):
 
 class SimulationOverride(StrictModel):
     key: str
-    value: Any
+    value: JsonValue
     rationale: str
     canonical: bool = False
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def validate_json_value(cls, value: Any) -> JsonValue:
+        """Accept only bounded, interoperable JSON data.
+
+        The validator deliberately handles exact built-in JSON types only. It never
+        asks an unsupported object for a representation, iterator, mapping view, or
+        type metadata. Out-of-contract input is an ordinary structured Pydantic error;
+        only valid JSON values proceed to game-specific semantic validation.
+        """
+
+        try:
+            return _validate_json_value(
+                value,
+                max_depth=OVERRIDE_JSON_MAX_DEPTH,
+                max_nodes=OVERRIDE_JSON_MAX_NODES,
+                max_bytes=OVERRIDE_JSON_MAX_BYTES,
+            )
+        except _InvalidJsonValue as exc:
+            raise PydanticCustomError(
+                "simulation_override_json",
+                _INVALID_OVERRIDE_REASONS[exc.category],
+                {"category": exc.category},
+            ) from None
 
 
 class SimulationConfig(StrictModel):
@@ -68,6 +158,8 @@ class SimulationConfig(StrictModel):
     player_policy: PlayerPolicyKind = PlayerPolicyKind.PASSIVE
     deck_order: tuple[str, ...] = ()
     overrides: tuple[SimulationOverride, ...] = ()
+    scripted_steps: tuple[ScriptedPolicyStep, ...] = ()
+    strict_semantics: bool = False
 
     @model_validator(mode="after")
     def require_valid_limits_and_unique_overrides(self) -> "SimulationConfig":
@@ -76,6 +168,13 @@ class SimulationConfig(StrictModel):
         keys = [item.key for item in self.overrides]
         if len(keys) != len(set(keys)):
             raise ValueError("simulation override keys must be unique")
+        if self.player_policy is PlayerPolicyKind.SCRIPTED and not self.scripted_steps:
+            raise ValueError("scripted player policy requires at least one scripted step")
+        if self.player_policy is not PlayerPolicyKind.SCRIPTED and self.scripted_steps:
+            raise ValueError("scripted steps require the scripted player policy")
+        positions = [(item.turn, item.actor_id) for item in self.scripted_steps]
+        if len(positions) != len(set(positions)):
+            raise ValueError("only one scripted step is allowed per turn and actor")
         return self
 
     def override_map(self) -> dict[str, Any]:
@@ -100,6 +199,7 @@ class SimulationEvent(StrictModel):
     entity_ids: tuple[str, ...] = ()
     data: dict[str, Any] = Field(default_factory=dict)
     assertion_ids: tuple[str, ...] = ()
+    semantic_ids: tuple[str, ...] = ()
 
 
 class SimulationCheckpoint(StrictModel):
@@ -178,6 +278,7 @@ class SimulationRun(StrictModel):
     state_trace: tuple[SimulationCheckpoint, ...] = ()
     blockers: tuple[SimulationBlocker, ...] = ()
     metrics: SimulationMetrics
+    semantic_audit: "SemanticAudit | None" = None
 
     def evidence_claim(self) -> EvidenceClaim:
         ruleset_note = (
@@ -230,7 +331,58 @@ class InProcessSimulationRunner:
     def run(
         self, plugin: SimulationPlugin, snapshot: DesignSnapshot, config: SimulationConfig
     ) -> SimulationRun:
+        _require_simulation_config(config)
         return plugin.run(snapshot, config, runner=self.id)
+
+
+class ScriptedPlayerPolicy:
+    """Consumes exact declared actions and never substitutes a fallback choice."""
+
+    def __init__(self, steps: tuple[ScriptedPolicyStep, ...]) -> None:
+        self._steps = steps
+        self._position = 0
+
+    def consume(
+        self,
+        *,
+        turn: int,
+        actor_id: str,
+        legal_steps: tuple[ScriptedPolicyStep, ...],
+    ) -> tuple[ScriptedPolicyStep | None, SimulationBlocker | None]:
+        if self._position >= len(self._steps):
+            return None, self._blocker(turn, actor_id, "The scripted policy has no next step.")
+        step = self._steps[self._position]
+        if (step.turn, step.actor_id) != (turn, actor_id):
+            return None, self._blocker(
+                turn,
+                actor_id,
+                f"The next scripted step is for turn {step.turn}, actor {step.actor_id!r}.",
+            )
+        if step not in legal_steps:
+            return None, self._blocker(
+                turn,
+                actor_id,
+                f"Scripted action {step.action.value!r} is not legal in the current state.",
+                entity_ids=tuple(item for item in (step.card_id, step.target_id) if item),
+            )
+        self._position += 1
+        return step, None
+
+    @staticmethod
+    def _blocker(
+        turn: int,
+        actor_id: str,
+        message: str,
+        *,
+        entity_ids: tuple[str, ...] = (),
+    ) -> SimulationBlocker:
+        return SimulationBlocker(
+            id=f"policy:blocker:turn-{turn}:{actor_id}",
+            kind=BlockerKind.INVALID_CONFIGURATION,
+            message=message,
+            entity_ids=entity_ids,
+            required_input="Supply the exact next legal scripted step; no fallback policy is used.",
+        )
 
 
 class DockerSimulationRunner:
@@ -281,6 +433,40 @@ class DockerSimulationRunner:
             "/output/result.json",
         ]
 
+    def request_payload(
+        self,
+        plugin: SimulationPlugin,
+        snapshot: DesignSnapshot,
+        config: SimulationConfig,
+    ) -> dict[str, Any]:
+        """Build the exact JSON-safe payload handed to the isolated worker."""
+
+        _require_simulation_config(config)
+        payload = {
+            "plugin_id": plugin.id,
+            "snapshot": snapshot.model_dump(mode="json"),
+            "config": config.model_dump(mode="json"),
+            "runner": self.id,
+            "container_image_digest": self.image_digest,
+        }
+        try:
+            bounded = _validate_json_value(
+                payload,
+                max_depth=SIMULATION_INPUT_MAX_DEPTH,
+                max_nodes=SIMULATION_INPUT_MAX_NODES,
+                max_bytes=SIMULATION_INPUT_MAX_BYTES,
+            )
+        except _InvalidJsonValue as exc:
+            reason = _json_boundary_reason(
+                exc.category,
+                max_bytes=SIMULATION_INPUT_MAX_BYTES,
+                max_depth=SIMULATION_INPUT_MAX_DEPTH,
+                max_nodes=SIMULATION_INPUT_MAX_NODES,
+            )
+            raise SimulationJsonInputError(exc.category, reason) from None
+        assert isinstance(bounded, dict)
+        return bounded
+
     def run(
         self, plugin: SimulationPlugin, snapshot: DesignSnapshot, config: SimulationConfig
     ) -> SimulationRun:
@@ -288,15 +474,16 @@ class DockerSimulationRunner:
             prefix="playtrace-sim-output-"
         ) as output_name:
             input_dir, output_dir = Path(input_name), Path(output_name)
-            request = {
-                "plugin_id": plugin.id,
-                "snapshot": snapshot.model_dump(mode="json"),
-                "config": config.model_dump(mode="json"),
-                "runner": self.id,
-                "container_image_digest": self.image_digest,
-            }
+            request = self.request_payload(plugin, snapshot, config)
             (input_dir / "request.json").write_text(
-                json.dumps(request, separators=(",", ":")), encoding="utf-8"
+                json.dumps(
+                    request,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
             )
             subprocess.run(
                 self.command(input_dir.resolve(), output_dir.resolve()),
@@ -305,8 +492,8 @@ class DockerSimulationRunner:
                 capture_output=True,
                 text=True,
             )
-            result = SimulationRun.model_validate_json(
-                (output_dir / "result.json").read_text(encoding="utf-8")
+            result = SimulationRun.model_validate(
+                load_bounded_json_file(output_dir / "result.json")
             )
             return result.model_copy(
                 update={
@@ -318,11 +505,385 @@ class DockerSimulationRunner:
 
 
 def content_digest(value: Any) -> str:
+    """Return a stable digest for an internal JSON-compatible value or model."""
+
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="json")
     return hashlib.sha256(
-        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode(
-            "utf-8"
-        )
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8", errors="strict")
     ).hexdigest()
+
+
+def _require_simulation_config(config: object) -> None:
+    """Reject the wrong top-level type at the runner's trusted Python boundary.
+
+    Public callers construct ``SimulationConfig`` normally or use ``model_validate``.
+    Pydantic's validation-bypassing ``model_construct`` API is deliberately a
+    trusted-internal facility and is outside this runner contract; runners do not
+    attempt to repair or sanitize arbitrary graphs created through it.
+    """
+
+    if not isinstance(config, SimulationConfig):
+        raise TypeError("config must be a validated SimulationConfig")
+
+
+def load_bounded_json_file(
+    path: Path,
+    *,
+    max_bytes: int = SIMULATION_INPUT_MAX_BYTES,
+    max_depth: int = SIMULATION_INPUT_MAX_DEPTH,
+    max_nodes: int = SIMULATION_INPUT_MAX_NODES,
+) -> JsonValue:
+    """Read strict JSON only after byte-size preflight, then enforce budgets.
+
+    This is the external file boundary used for simulation configuration and worker
+    requests. It rejects pathological numeric tokens and nesting before Python creates
+    large integers or the recursive JSON decoder is entered.
+    """
+
+    if path.stat().st_size > max_bytes:
+        raise SimulationJsonInputError(
+            "maximum_size", f"JSON input may be at most {max_bytes} bytes."
+        )
+    payload = path.read_bytes()
+    if len(payload) > max_bytes:
+        raise SimulationJsonInputError(
+            "maximum_size", f"JSON input may be at most {max_bytes} bytes."
+        )
+    try:
+        text = payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise SimulationJsonInputError(
+            "invalid_unicode", "JSON input must be valid UTF-8."
+        ) from exc
+    return decode_bounded_json(
+        text,
+        max_bytes=max_bytes,
+        max_depth=max_depth,
+        max_nodes=max_nodes,
+    )
+
+
+def decode_bounded_json(
+    text: str,
+    *,
+    max_bytes: int = SIMULATION_INPUT_MAX_BYTES,
+    max_depth: int = SIMULATION_INPUT_MAX_DEPTH,
+    max_nodes: int = SIMULATION_INPUT_MAX_NODES,
+) -> JsonValue:
+    """Decode a strict JSON document under size, depth, node, and number limits."""
+
+    _preflight_raw_utf8_size(text, max_bytes=max_bytes)
+    _preflight_json_structure(
+        text, max_depth=max_depth, max_nodes=max_nodes
+    )
+
+    def parse_integer(token: str) -> int:
+        digits = token[1:] if token.startswith("-") else token
+        # All accepted values have at most 16 decimal digits. Avoid allocating an
+        # arbitrary-precision integer for a hostile token.
+        if len(digits) > 16:
+            raise SimulationJsonInputError(
+                "integer_out_of_range", _INVALID_OVERRIDE_REASONS["integer_out_of_range"]
+            )
+        value = int(token)
+        if value < -JSON_SAFE_INTEGER_MAX or value > JSON_SAFE_INTEGER_MAX:
+            raise SimulationJsonInputError(
+                "integer_out_of_range", _INVALID_OVERRIDE_REASONS["integer_out_of_range"]
+            )
+        return value
+
+    def parse_number(token: str) -> float:
+        value = float(token)
+        if not math.isfinite(value):
+            raise SimulationJsonInputError(
+                "non_finite_float", _INVALID_OVERRIDE_REASONS["non_finite_float"]
+            )
+        return value
+
+    def reject_constant(token: str) -> None:
+        raise SimulationJsonInputError(
+            "non_finite_float", f"JSON constant {token!r} is not permitted."
+        )
+
+    try:
+        value = json.loads(
+            text,
+            parse_int=parse_integer,
+            parse_float=parse_number,
+            parse_constant=reject_constant,
+        )
+    except SimulationJsonInputError:
+        raise
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+        raise SimulationJsonInputError("malformed_json", "Malformed JSON input.") from exc
+    try:
+        return _validate_json_value(
+            value,
+            max_depth=max_depth,
+            max_nodes=max_nodes,
+            max_bytes=max_bytes,
+        )
+    except _InvalidJsonValue as exc:
+        reason = _json_boundary_reason(
+            exc.category,
+            max_bytes=max_bytes,
+            max_depth=max_depth,
+            max_nodes=max_nodes,
+        )
+        raise SimulationJsonInputError(exc.category, reason) from None
+
+
+def _json_boundary_reason(
+    category: str, *, max_bytes: int, max_depth: int, max_nodes: int
+) -> str:
+    if category == "maximum_size":
+        return f"JSON input may be at most {max_bytes} UTF-8 bytes."
+    if category == "maximum_depth":
+        return f"JSON input may be at most {max_depth} levels deep."
+    if category == "maximum_nodes":
+        return f"JSON input may contain at most {max_nodes} nodes."
+    return _INVALID_OVERRIDE_REASONS.get(
+        category, "JSON input exceeds the configured boundary."
+    )
+
+
+def _preflight_json_structure(
+    text: str, *, max_depth: int, max_nodes: int
+) -> None:
+    """Scan structural budgets before the recursive JSON decoder is entered.
+
+    Each container, scalar string/value, and object key is one node, matching the
+    post-decode validator. Container depth is the number of containers on a path: a
+    root array or object has depth one, while a scalar document has depth zero. The
+    scanner is intentionally not a second JSON parser: malformed syntax is still
+    diagnosed by ``json.loads`` after budgets are known to be safe.
+    """
+
+    depth = 0
+    nodes = 0
+    in_string = False
+    escaped = False
+    in_atom = False
+
+    def consume_node() -> None:
+        nonlocal nodes
+        nodes += 1
+        if nodes > max_nodes:
+            raise SimulationJsonInputError(
+                "maximum_nodes",
+                f"JSON input may contain at most {max_nodes} nodes.",
+            )
+
+    for character in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+            in_atom = False
+            consume_node()
+        elif character in "[{":
+            in_atom = False
+            consume_node()
+            depth += 1
+            if depth > max_depth:
+                raise SimulationJsonInputError(
+                    "maximum_depth", f"JSON input may be at most {max_depth} levels deep."
+                )
+        elif character in "]}":
+            in_atom = False
+            depth -= 1
+        elif character in ",:":
+            in_atom = False
+        elif character.isspace():
+            in_atom = False
+        elif not in_atom:
+            in_atom = True
+            consume_node()
+
+
+def _preflight_raw_utf8_size(text: str, *, max_bytes: int) -> None:
+    """Count input bytes without allocating a second full encoded document."""
+
+    total = 0
+    for character in text:
+        codepoint = ord(character)
+        if codepoint < 0x80:
+            total += 1
+        elif codepoint < 0x800:
+            total += 2
+        elif 0xD800 <= codepoint <= 0xDFFF:
+            raise SimulationJsonInputError(
+                "invalid_unicode", "JSON input must not contain unpaired surrogates."
+            )
+        elif codepoint < 0x10000:
+            total += 3
+        else:
+            total += 4
+        if total > max_bytes:
+            raise SimulationJsonInputError(
+                "maximum_size", f"JSON input may be at most {max_bytes} bytes."
+            )
+
+
+class _InvalidJsonValue(ValueError):
+    def __init__(self, category: str) -> None:
+        self.category = category
+        super().__init__(category)
+
+
+class _JsonBudget:
+    def __init__(self, *, max_nodes: int, max_bytes: int) -> None:
+        self.nodes = 0
+        self.bytes = 0
+        self.max_nodes = max_nodes
+        self.max_bytes = max_bytes
+
+    def consume(self) -> None:
+        self.nodes += 1
+        if self.nodes > self.max_nodes:
+            raise _InvalidJsonValue("maximum_nodes")
+
+    def consume_bytes(self, amount: int) -> None:
+        self.bytes += amount
+        if self.bytes > self.max_bytes:
+            raise _InvalidJsonValue("maximum_size")
+
+
+def _validate_json_value(
+    value: Any,
+    *,
+    max_depth: int,
+    max_nodes: int,
+    max_bytes: int,
+) -> JsonValue:
+    """Validate and canonicalize exact JSON types with incremental budgets."""
+
+    budget = _JsonBudget(max_nodes=max_nodes, max_bytes=max_bytes)
+    return _validate_json_node(
+        value,
+        depth=0,
+        max_depth=max_depth,
+        active=set(),
+        budget=budget,
+    )
+
+
+def _validate_json_node(
+    value: Any,
+    *,
+    depth: int,
+    max_depth: int,
+    active: set[int],
+    budget: _JsonBudget,
+) -> Any:
+    budget.consume()
+
+    value_type = type(value)
+    if value is None or value_type is bool:
+        budget.consume_bytes(4 if value is None or value is True else 5)
+        return value
+    if value_type is int:
+        if value < -JSON_SAFE_INTEGER_MAX or value > JSON_SAFE_INTEGER_MAX:
+            raise _InvalidJsonValue("integer_out_of_range")
+        budget.consume_bytes(len(str(value)))
+        return value
+    if value_type is float:
+        if not math.isfinite(value):
+            raise _InvalidJsonValue("non_finite_float")
+        budget.consume_bytes(len(json.dumps(value)))
+        return value
+    if value_type is str:
+        _consume_json_string(value, budget)
+        return value
+    if value_type is list:
+        container_depth = depth + 1
+        if container_depth > max_depth:
+            raise _InvalidJsonValue("maximum_depth")
+        identity = id(value)
+        if identity in active:
+            raise _InvalidJsonValue("cycle")
+        active.add(identity)
+        try:
+            budget.consume_bytes(2 + max(0, len(value) - 1))
+            return [
+                _validate_json_node(
+                    item,
+                    depth=container_depth,
+                    max_depth=max_depth,
+                    active=active,
+                    budget=budget,
+                )
+                for item in value
+            ]
+        finally:
+            active.remove(identity)
+    if value_type is dict:
+        container_depth = depth + 1
+        if container_depth > max_depth:
+            raise _InvalidJsonValue("maximum_depth")
+        identity = id(value)
+        if identity in active:
+            raise _InvalidJsonValue("cycle")
+        active.add(identity)
+        try:
+            budget.consume_bytes(2 + max(0, len(value) - 1) + len(value))
+            for key in value:
+                budget.consume()
+                if type(key) is not str:
+                    raise _InvalidJsonValue("non_string_key")
+                _consume_json_string(key, budget)
+            return {
+                key: _validate_json_node(
+                    value[key],
+                    depth=container_depth,
+                    max_depth=max_depth,
+                    active=active,
+                    budget=budget,
+                )
+                for key in sorted(value)
+            }
+        finally:
+            active.remove(identity)
+    raise _InvalidJsonValue("unsupported_type")
+
+
+def _consume_json_string(value: str, budget: _JsonBudget) -> None:
+    """Count exact compact JSON UTF-8 bytes without allocating an encoded copy."""
+
+    budget.consume_bytes(2)
+    # Every code point needs at least one byte. This rejects large strings before
+    # traversing or encoding them.
+    if len(value) > budget.max_bytes - budget.bytes:
+        raise _InvalidJsonValue("maximum_size")
+    for character in value:
+        codepoint = ord(character)
+        if codepoint in (0x22, 0x5C) or character in "\b\f\n\r\t":
+            budget.consume_bytes(2)
+        elif codepoint < 0x20:
+            budget.consume_bytes(6)
+        elif codepoint < 0x80:
+            budget.consume_bytes(1)
+        elif codepoint < 0x800:
+            budget.consume_bytes(2)
+        elif 0xD800 <= codepoint <= 0xDFFF:
+            raise _InvalidJsonValue("invalid_unicode")
+        elif codepoint < 0x10000:
+            budget.consume_bytes(3)
+        else:
+            budget.consume_bytes(4)
 
 
 def snapshot_content_digest(snapshot: DesignSnapshot) -> str:
@@ -335,3 +896,8 @@ def snapshot_content_digest(snapshot: DesignSnapshot) -> str:
     for assertion in payload["assertions"]:
         assertion["provenance"].pop("extracted_at", None)
     return content_digest(payload)
+
+
+from playtrace.semantics import SemanticAudit  # noqa: E402  (forward model rebuild)
+
+SimulationRun.model_rebuild()

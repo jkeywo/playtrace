@@ -4,14 +4,28 @@ from __future__ import annotations
 
 import random
 import re
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
+from pydantic import BaseModel, ValidationError
+
+from playtrace.cnl import RuleIR
 from playtrace.models import DesignEntity, DesignSnapshot
+from playtrace.plugins.registry import register_simulation_plugin
+from playtrace.rule_execution import ExactRuleExecutor, RuleExecutionState
+from playtrace.semantics import (
+    SemanticOrigin,
+    SemanticUsage,
+    audit_semantics,
+)
 from playtrace.simulation import (
     BlockerKind,
     PlayerSimulationState,
     PlayerPolicyKind,
+    PlayerActionKind,
+    ScriptedPlayerPolicy,
+    ScriptedPolicyStep,
     SimulationBlocker,
     SimulationConfig,
     SimulationCheckpoint,
@@ -26,9 +40,51 @@ from playtrace.simulation import (
 )
 
 
+@dataclass(frozen=True)
+class _OverrideContract:
+    origin: SemanticOrigin
+    description: str
+    provenance: tuple[str, ...]
+
+
+_SUPPORTED_OVERRIDE_CONTRACTS = {
+    "starting_cubes": _OverrideContract(
+        origin=SemanticOrigin.PLUGIN_EXTENSION,
+        description="Explicit setup cube counts consumed by the registered setup boundary.",
+        provenance=("CrisisWardensSimulationPlugin.run",),
+    ),
+    "scenario_deck_card_ids": _OverrideContract(
+        origin=SemanticOrigin.PLUGIN_EXTENSION,
+        description="Explicit scenario deck membership consumed by the registered deck boundary.",
+        provenance=("CrisisWardensSimulationPlugin._deck",),
+    ),
+    "allow_pass": _OverrideContract(
+        origin=SemanticOrigin.PLUGIN_EXTENSION,
+        description="Registered permission for passive or scripted responders to pass.",
+        provenance=("CrisisWardensSimulationPlugin._Runtime.take_player_turn",),
+    ),
+    "end_turn_pressure": _OverrideContract(
+        origin=SemanticOrigin.PROVISIONAL_OVERRIDE,
+        description="Experimental escalation-level end-turn pressure schedule.",
+        provenance=("CrisisWardensSimulationPlugin._Runtime.resolve_end_of_turn",),
+    ),
+    "end_turn_pressure_target": _OverrideContract(
+        origin=SemanticOrigin.PROVISIONAL_OVERRIDE,
+        description="Experimental target policy for end-turn pressure.",
+        provenance=("CrisisWardensSimulationPlugin._Runtime.resolve_end_of_turn",),
+    ),
+}
+
+_PRESSURE_LEVELS = frozenset({"rising", "flooding", "emergency", "catastrophic"})
+_PRESSURE_TARGETS = frozenset({"highest", "lowest"})
+_PROVISIONAL_PLACEHOLDER_EFFECT_ID = "cw:provisional:placeholder-effects"
+
+
+@register_simulation_plugin
 class CrisisWardensSimulationPlugin:
     id = "crisis-wardens-tabletop"
-    version = "0.2.0"
+    version = "0.3.0"
+    project_ids = ("crisis-wardens",)
     provisional_ruleset = "cw:rules:provisional-core-v0.2"
 
     def run(
@@ -39,18 +95,9 @@ class CrisisWardensSimulationPlugin:
         blockers: list[SimulationBlocker] = []
         overrides = config.override_map()
         provisional = config.ruleset_id == self.provisional_ruleset
-        if overrides.get("end_turn_pressure_target", "highest") not in {
-            "highest",
-            "lowest",
-        }:
-            blockers.append(
-                _blocker(
-                    "end-turn-pressure-target",
-                    BlockerKind.INVALID_CONFIGURATION,
-                    "end_turn_pressure_target must be 'highest' or 'lowest'.",
-                    (config.scenario_id,),
-                )
-            )
+        blockers.extend(_override_configuration_blockers(config))
+        if blockers:
+            return self._blocked(snapshot, config, runner, blockers)
         if config.ruleset_id and not provisional:
             blockers.append(
                 _blocker(
@@ -137,14 +184,30 @@ class CrisisWardensSimulationPlugin:
                 )
             )
         starting_ids = tuple(by_name[name] for name in starting_names if name in by_name)
+        supplied_starting_cubes = overrides.get("starting_cubes")
+        if isinstance(supplied_starting_cubes, dict) and set(
+            supplied_starting_cubes
+        ) != set(starting_ids):
+            missing = tuple(sorted(set(starting_ids).difference(supplied_starting_cubes)))
+            extra = tuple(sorted(set(supplied_starting_cubes).difference(starting_ids)))
+            blockers.append(
+                _blocker(
+                    "override-starting-cubes-keys",
+                    BlockerKind.INVALID_CONFIGURATION,
+                    "starting_cubes keys must exactly equal the scenario's starting tableau card IDs.",
+                    (*missing, *extra),
+                    required_input=(
+                        "Supply exactly these starting tableau IDs: "
+                        + ", ".join(starting_ids)
+                    ),
+                )
+            )
         starting_cubes = (
             {card_id: 0 for card_id in starting_ids}
-            if provisional
-            else overrides.get("starting_cubes")
+            if provisional and supplied_starting_cubes is None
+            else supplied_starting_cubes
         )
-        if not isinstance(starting_cubes, dict) or any(
-            card_id not in starting_cubes for card_id in starting_ids
-        ):
+        if not isinstance(starting_cubes, dict):
             blockers.append(
                 _blocker(
                     "starting-cubes",
@@ -206,6 +269,12 @@ class CrisisWardensSimulationPlugin:
             )
             return self._blocked(snapshot, config, runner, blockers)
 
+        preflight_audit = audit_semantics(
+            _semantic_usages(snapshot, config, ()), strict=config.strict_semantics
+        )
+        if preflight_audit.blocking_usage_ids:
+            return self._blocked(snapshot, config, runner, blockers)
+
         initial = TabletopSimulationState(
             escalation=escalation[0],
             deck=deck,
@@ -257,6 +326,18 @@ class CrisisWardensSimulationPlugin:
                 PlayerPolicyKind.RANDOM_CONSTRAINED,
             }:
                 runtime.take_player_turn(actor)
+            elif provisional and config.player_policy is PlayerPolicyKind.SCRIPTED:
+                assert actor is not None
+                step, blocker = runtime.scripted_policy.consume(
+                    turn=runtime.turn,
+                    actor_id=actor,
+                    legal_steps=runtime.legal_scripted_steps(actor),
+                )
+                if blocker:
+                    runtime.block(blocker)
+                else:
+                    assert step is not None
+                    runtime.take_player_turn(actor, scripted_step=step)
             elif config.player_policy is PlayerPolicyKind.PASSIVE:
                 runtime.emit(
                     "player.action_skipped",
@@ -372,11 +453,29 @@ class CrisisWardensSimulationPlugin:
         runner: str,
         blockers: list[SimulationBlocker],
     ) -> SimulationRun:
+        audit = audit_semantics(
+            _semantic_usages(snapshot, config, tuple(blockers)),
+            strict=config.strict_semantics,
+        )
+        known = {item.id for item in blockers}
+        for usage_id in audit.blocking_usage_ids:
+            blocker_id = f"cw:blocker:semantic-audit:{usage_id}"
+            if blocker_id not in known:
+                blockers.append(
+                    _blocker(
+                        f"semantic-audit:{usage_id}",
+                        BlockerKind.UNSUPPORTED_RULE,
+                        f"Strict semantic audit rejected {usage_id!r}.",
+                        (),
+                        required_input="Replace provisional or ambiguous semantics with compiled or registered extension semantics.",
+                    )
+                )
         provenance = _provenance(snapshot, config, self, runner)
         identity = content_digest(
             {
                 "provenance": provenance.model_dump(mode="json", exclude={"observed_at"}),
                 "blockers": [item.model_dump(mode="json") for item in blockers],
+                "semantic_audit": audit.model_dump(mode="json"),
             }
         )[:20]
         return SimulationRun(
@@ -384,6 +483,7 @@ class CrisisWardensSimulationPlugin:
             config=config,
             provenance=provenance,
             blockers=tuple(blockers),
+            semantic_audit=audit,
             metrics=SimulationMetrics(
                 turns_completed=0,
                 cards_resolved=0,
@@ -452,8 +552,44 @@ class _Runtime:
         self.suppressed_thresholds: set[str] = set()
         self.prevent_next_structure = False
         self.affinity_gained: set[str] = set()
+        self.rule_executor = ExactRuleExecutor()
+        self.scripted_policy = ScriptedPlayerPolicy(config.scripted_steps)
 
-    def take_player_turn(self, actor_id: str | None) -> None:
+    def legal_scripted_steps(self, actor_id: str) -> tuple[ScriptedPolicyStep, ...]:
+        player = self.players[actor_id]
+        steps = [
+            ScriptedPolicyStep(
+                turn=self.turn,
+                actor_id=actor_id,
+                action=PlayerActionKind.ACTIVATE_CARD,
+                card_id=card_id,
+            )
+            for card_id in sorted(player["hand"])
+        ]
+        if not player["hand"] and not player["deck"] and player["discard"]:
+            steps.append(
+                ScriptedPolicyStep(
+                    turn=self.turn,
+                    actor_id=actor_id,
+                    action=PlayerActionKind.REST,
+                )
+            )
+        if self.config.override_map().get("allow_pass") is True:
+            steps.append(
+                ScriptedPolicyStep(
+                    turn=self.turn,
+                    actor_id=actor_id,
+                    action=PlayerActionKind.PASS,
+                )
+            )
+        return tuple(steps)
+
+    def take_player_turn(
+        self,
+        actor_id: str | None,
+        *,
+        scripted_step: ScriptedPolicyStep | None = None,
+    ) -> None:
         if actor_id is None or actor_id not in self.players:
             self.block(
                 _blocker(
@@ -469,26 +605,27 @@ class _Runtime:
         self.suppressed_thresholds.clear()
         self.prevent_next_structure = False
         self.affinity_gained.discard(actor_id)
+        if scripted_step and scripted_step.action is PlayerActionKind.PASS:
+            self.emit("player.action_skipped", actor_id=actor_id, data={"policy": "scripted"})
+            return
+        if scripted_step and scripted_step.action is PlayerActionKind.REST:
+            self._rest(actor_id)
+            return
         if not player["hand"]:
             if not player["deck"] and player["discard"]:
-                seed = int(content_digest([self.config.seed, actor_id, self.turn, "rest"])[:16], 16)
-                random.Random(seed).shuffle(player["discard"])
-                player["deck"] = player["discard"]
-                player["discard"] = []
-                player["rests"] += 1
-                self._draw_to_hand(actor_id)
-                self.emit(
-                    "player.rested",
-                    actor_id=actor_id,
-                    data={"hand_size": len(player["hand"])},
-                )
+                self._rest(actor_id)
                 return
             self._draw_to_hand(actor_id)
         if not player["hand"]:
             self.emit("player.no_action", actor_id=actor_id)
             return
 
-        card_id = self._choose_activation(actor_id)
+        card_id = (
+            scripted_step.card_id
+            if scripted_step is not None
+            else self._choose_activation(actor_id)
+        )
+        assert card_id is not None
         player["hand"].remove(card_id)
         card = self.character_cards[card_id]
         fields = _fields(card)
@@ -519,6 +656,16 @@ class _Runtime:
             self.emit("player.ap_lost", actor_id=actor_id, data={"amount": ap})
         player["discard"].append(card_id)
         self.emit("player.card_discarded", actor_id=actor_id, entity_ids=(card_id,))
+
+    def _rest(self, actor_id: str) -> None:
+        player = self.players[actor_id]
+        seed = int(content_digest([self.config.seed, actor_id, self.turn, "rest"])[:16], 16)
+        random.Random(seed).shuffle(player["discard"])
+        player["deck"] = player["discard"]
+        player["discard"] = []
+        player["rests"] += 1
+        self._draw_to_hand(actor_id)
+        self.emit("player.rested", actor_id=actor_id, data={"hand_size": len(player["hand"])})
 
     def _choose_activation(self, actor_id: str) -> str:
         hand = self.players[actor_id]["hand"]
@@ -764,7 +911,16 @@ class _Runtime:
     def improve(self, card_id: str, *, source_id: str, actor_id: str | None = None) -> None:
         if card_id not in self.tableau or self.tableau[card_id] <= 0:
             return
-        self.tableau[card_id] -= 1
+        execution = self.rule_executor.apply_state_change(
+            source_id,
+            "improve",
+            card_id,
+            RuleExecutionState(tableau=self.tableau),
+        )
+        if execution.blockers:
+            self.block(execution.blockers[0])
+            return
+        self.tableau = dict(execution.state.tableau)
         self.emit(
             "card.improved",
             actor_id=actor_id,
@@ -815,6 +971,7 @@ class _Runtime:
         entity_ids: tuple[str, ...] = (),
         data: dict[str, Any] | None = None,
         assertion_ids: tuple[str, ...] = (),
+        semantic_ids: tuple[str, ...] = (),
     ) -> None:
         event = SimulationEvent(
                 sequence=len(self.events),
@@ -826,6 +983,7 @@ class _Runtime:
                 assertion_ids=tuple(
                     item for item in assertion_ids if item in self.assertions
                 ),
+                semantic_ids=semantic_ids,
             )
         self.events.append(event)
         self.state_trace.append(
@@ -948,6 +1106,11 @@ class _Runtime:
             )
         elif card_id == "SCD-011":
             if self.provisional:
+                self.emit(
+                    "provisional.effect_applied",
+                    entity_ids=(card_id,),
+                    semantic_ids=(_PROVISIONAL_PLACEHOLDER_EFFECT_ID,),
+                )
                 target = self._highest_cubes("Hazard")
                 if target:
                     self.improve(target, source_id=card_id)
@@ -1027,7 +1190,16 @@ class _Runtime:
         if self._play_prevention_assist(card_id, source_id):
             return
         before = self.tableau[card_id]
-        self.tableau[card_id] += 1
+        execution = self.rule_executor.apply_state_change(
+            source_id,
+            "worsen",
+            card_id,
+            RuleExecutionState(tableau=self.tableau),
+        )
+        if execution.blockers:
+            self.block(execution.blockers[0])
+            return
+        self.tableau = dict(execution.state.tableau)
         self.maximum_tableau_cubes = max(
             self.maximum_tableau_cubes, self.tableau[card_id]
         )
@@ -1096,6 +1268,11 @@ class _Runtime:
         elif card_id == "SCD-004":
             self.advance_escalation(card_id)
         elif self.provisional and card_id == "SCD-002":
+            self.emit(
+                "provisional.effect_applied",
+                entity_ids=(card_id,),
+                semantic_ids=(_PROVISIONAL_PLACEHOLDER_EFFECT_ID,),
+            )
             del self.tableau[card_id]
             del self.cube_meanings[card_id]
             self.emit("tableau.card_collapsed", entity_ids=(card_id,), data={"provisional_effect": "discard, fatigue each responder, escalate"})
@@ -1103,6 +1280,11 @@ class _Runtime:
                 self.fatigue(actor_id, 1, source_id=card_id)
             self.advance_escalation(card_id)
         elif self.provisional and card_id == "SCD-003":
+            self.emit(
+                "provisional.effect_applied",
+                entity_ids=(card_id,),
+                semantic_ids=(_PROVISIONAL_PLACEHOLDER_EFFECT_ID,),
+            )
             if "SCD-004" in self.tableau:
                 self.worsen("SCD-004", source_id=card_id)
             else:
@@ -1111,6 +1293,11 @@ class _Runtime:
                 self.cube_meanings["SCD-004"] = str(_fields(self.cards["SCD-004"]).get("Cube Meaning", "Disorder"))
                 self.emit("tableau.card_added", entity_ids=("SCD-004",), data={"cubes": 2, "source_id": card_id})
         elif self.provisional and card_id == "SCD-008":
+            self.emit(
+                "provisional.effect_applied",
+                entity_ids=(card_id,),
+                semantic_ids=(_PROVISIONAL_PLACEHOLDER_EFFECT_ID,),
+            )
             targets = tuple(item for item in self.tableau if self._has_keyword(item, "Structure"))
             for target in targets:
                 if self.status is SimulationStatus.RUNNING:
@@ -1182,11 +1369,21 @@ class _Runtime:
             fatigue_discarded=sum(player["fatigue_discarded"] for player in self.players.values()),
         )
         provenance = _provenance(self.snapshot, self.config, plugin, runner)
+        audit = audit_semantics(
+            _semantic_usages(
+                self.snapshot,
+                self.config,
+                tuple(self.blockers),
+                events=tuple(self.events),
+            ),
+            strict=self.config.strict_semantics,
+        )
         identity = content_digest(
             {
                 "provenance": provenance.model_dump(mode="json", exclude={"observed_at"}),
                 "events": [item.model_dump(mode="json") for item in self.events],
                 "final": final.model_dump(mode="json"),
+                "semantic_audit": audit.model_dump(mode="json"),
             }
         )[:20]
         return SimulationRun(
@@ -1198,6 +1395,7 @@ class _Runtime:
             events=tuple(self.events),
             state_trace=tuple(self.state_trace),
             blockers=tuple(self.blockers),
+            semantic_audit=audit,
             metrics=metrics,
         )
 
@@ -1218,7 +1416,7 @@ def _provenance(
         backend_version=backend_version,
         plugin_id=plugin.id,
         plugin_version=plugin.version,
-        config_digest=content_digest(config.model_dump(mode="json")),
+        config_digest=content_digest(config),
         player_policy=config.player_policy,
         seeds=(config.seed,),
         runner=runner,
@@ -1244,6 +1442,347 @@ def _blocker(
         required_input=required_input,
         overridable=overridable,
     )
+
+
+def _override_configuration_blockers(
+    config: SimulationConfig,
+) -> tuple[SimulationBlocker, ...]:
+    """Validate every registered override before plugin code consumes its ``Any`` value."""
+
+    overrides = config.override_map()
+    unknown = tuple(sorted(set(overrides).difference(_SUPPORTED_OVERRIDE_CONTRACTS)))
+    if unknown:
+        return (
+            _blocker(
+                "unknown-overrides",
+                BlockerKind.INVALID_CONFIGURATION,
+                "The configuration contains override keys this plugin does not support.",
+                unknown,
+                required_input=(
+                    "Use only registered Crisis Wardens override keys: "
+                    + ", ".join(sorted(_SUPPORTED_OVERRIDE_CONTRACTS))
+                ),
+            ),
+        )
+
+    blockers: list[SimulationBlocker] = []
+    for key, value in overrides.items():
+        message: str | None = None
+        if key == "starting_cubes":
+            valid = isinstance(value, dict) and all(
+                isinstance(card_id, str)
+                and bool(card_id.strip())
+                and isinstance(count, int)
+                and not isinstance(count, bool)
+                and count >= 0
+                for card_id, count in value.items()
+            )
+            if not valid:
+                message = (
+                    "starting_cubes must be a mapping of non-empty card IDs to "
+                    "non-negative integer cube counts."
+                )
+        elif key == "scenario_deck_card_ids":
+            valid = isinstance(value, list) and all(
+                isinstance(card_id, str) and bool(card_id.strip())
+                for card_id in value
+            )
+            if not valid:
+                message = "scenario_deck_card_ids must be a list of non-empty card IDs."
+        elif key == "allow_pass":
+            if not isinstance(value, bool):
+                message = "allow_pass must be a boolean."
+        elif key == "end_turn_pressure":
+            valid = isinstance(value, dict) and all(
+                isinstance(level, str)
+                and level in _PRESSURE_LEVELS
+                and isinstance(amount, int)
+                and not isinstance(amount, bool)
+                and 0 <= amount <= 3
+                for level, amount in value.items()
+            )
+            if not valid:
+                message = (
+                    "end_turn_pressure must map rising, flooding, emergency, or "
+                    "catastrophic to integer amounts from zero to three."
+                )
+        elif key == "end_turn_pressure_target":
+            if not isinstance(value, str) or value not in _PRESSURE_TARGETS:
+                message = "end_turn_pressure_target must be 'highest' or 'lowest'."
+        if message:
+            blockers.append(
+                _blocker(
+                    f"override-{key.replace('_', '-')}",
+                    BlockerKind.INVALID_CONFIGURATION,
+                    message,
+                    (config.scenario_id,),
+                    required_input=f"Supply a valid {key} value matching its registered contract.",
+                )
+            )
+    return tuple(blockers)
+
+
+def _semantic_usages(
+    snapshot: DesignSnapshot,
+    config: SimulationConfig,
+    blockers: tuple[SimulationBlocker, ...],
+    *,
+    events: tuple[SimulationEvent, ...] = (),
+) -> tuple[SemanticUsage, ...]:
+    exact_count = sum(
+        event.event_type in {"card.improved", "card.worsened"} for event in events
+    )
+    flow_count = sum(
+        event.event_type.startswith(("scenario.", "objective.")) for event in events
+    )
+    threshold_count = sum(
+        event.event_type in {"tableau.card_collapsed", "card.threshold_suppressed"}
+        or (
+            event.event_type == "scenario.escalated"
+            and event.data.get("source_id") != "SCD-012"
+        )
+        for event in events
+    )
+    responder_count = sum(
+        event.event_type.startswith("player.")
+        or event.event_type.startswith("assist.")
+        for event in events
+    )
+    usages: list[SemanticUsage] = [
+        SemanticUsage(
+            id="tabletop:exact-cube-effects-v1",
+            origin=SemanticOrigin.PLUGIN_EXTENSION,
+            description="Shared exact-target Improve/Worsen primitive used by the game runtime.",
+            provenance=("playtrace.rule_execution.ExactRuleExecutor",),
+            executed=bool(exact_count),
+            execution_count=exact_count,
+        ),
+        SemanticUsage(
+            id="crisis-wardens:scenario-flow-v0.3",
+            origin=SemanticOrigin.PLUGIN_EXTENSION,
+            description="Registered game-specific setup, scenario deck, escalation, victory, and catastrophic-loss priority.",
+            entity_ids=(config.scenario_id,),
+            provenance=("playtrace.plugins.crisis_wardens",),
+            executed=bool(flow_count),
+            execution_count=flow_count,
+        ),
+        SemanticUsage(
+            id="crisis-wardens:thresholds-v0.3",
+            origin=SemanticOrigin.PLUGIN_EXTENSION,
+            description="Registered threshold interrupts, card-specific consequences, and action resumption.",
+            entity_ids=(config.scenario_id,),
+            provenance=("CrisisWardensSimulationPlugin._Runtime.resolve_threshold",),
+            executed=bool(threshold_count),
+            execution_count=threshold_count,
+        ),
+        SemanticUsage(
+            id="crisis-wardens:responder-loop-v0.3",
+            origin=SemanticOrigin.PLUGIN_EXTENSION,
+            description="Registered hands, activation, AP, Rest, Fatigue, Elements, Assists, and responder powers.",
+            entity_ids=config.character_ids,
+            provenance=("CrisisWardensSimulationPlugin._Runtime.take_player_turn",),
+            executed=bool(responder_count),
+            execution_count=responder_count,
+        ),
+    ]
+    usages.extend(_compiled_rule_semantic_usages(snapshot))
+    if config.ruleset_id == CrisisWardensSimulationPlugin.provisional_ruleset:
+        provisional_counts = {
+            config.ruleset_id: len(events),
+            "cw:provisional:setup-and-deck-zones": sum(
+                event.event_type in {"simulation.started", "scenario.setup"}
+                for event in events
+            ),
+            "cw:provisional:responder-loop": responder_count,
+            _PROVISIONAL_PLACEHOLDER_EFFECT_ID: sum(
+                _PROVISIONAL_PLACEHOLDER_EFFECT_ID in event.semantic_ids
+                for event in events
+            ),
+            "cw:provisional:no-target-and-threshold-rulings": sum(
+                event.event_type == "effect.no_legal_target" for event in events
+            )
+            + threshold_count,
+        }
+        provisional_descriptions = {
+            config.ruleset_id: "Designer-authorized provisional complete-loop semantics.",
+            "cw:provisional:setup-and-deck-zones": "Zero setup cubes, generated event deck zones, and the escalation-card cap.",
+            "cw:provisional:responder-loop": "Three-card hands, AP, Rest, Fatigue, Elements, Assists, and powers.",
+            "cw:provisional:placeholder-effects": "Temporary scenario-card and threshold consequences for placeholder content.",
+            "cw:provisional:no-target-and-threshold-rulings": "No-legal-target fizzles and provisional threshold timing details.",
+        }
+        usages.extend(
+            SemanticUsage(
+                id=usage_id,
+                origin=SemanticOrigin.PROVISIONAL_OVERRIDE,
+                description=provisional_descriptions[usage_id],
+                entity_ids=(config.scenario_id, *config.character_ids),
+                provenance=("SimulationConfig.ruleset_id", "playtrace.plugins.crisis_wardens"),
+                executed=bool(count),
+                execution_count=count,
+            )
+            for usage_id, count in provisional_counts.items()
+        )
+    for override in config.overrides:
+        contract = _SUPPORTED_OVERRIDE_CONTRACTS.get(override.key)
+        if contract is None:
+            continue
+        count = _override_execution_count(override.key, config, events)
+        usages.append(
+            SemanticUsage(
+                id=f"override:{override.key}",
+                origin=contract.origin,
+                description=contract.description,
+                provenance=("SimulationConfig.overrides", *contract.provenance),
+                executed=bool(count),
+                execution_count=count,
+            )
+        )
+    if blockers:
+        usages.append(
+            SemanticUsage(
+                id="simulation:missing-ambiguous",
+                origin=SemanticOrigin.MISSING_AMBIGUOUS,
+                description="Execution encountered missing, ambiguous, unsupported, or invalid semantics.",
+                entity_ids=tuple(sorted({entity for blocker in blockers for entity in blocker.entity_ids})),
+                provenance=tuple(blocker.id for blocker in blockers),
+                executed=True,
+                execution_count=len(blockers),
+            )
+        )
+    return tuple(usages)
+
+
+def _compiled_rule_semantic_usages(
+    snapshot: DesignSnapshot,
+) -> tuple[SemanticUsage, ...]:
+    """Classify compiled semantics only after the complete RuleIR proof matches.
+
+    A ``compiled_rule`` label is not evidence by itself. The entity must contain a
+    typed RuleIR whose ID equals the entity ID, and a ``compiles_to`` assertion must
+    contain the same typed RuleIR. Only those assertions contribute provenance to the
+    compiled usage; incomplete or contradictory records remain visibly ambiguous.
+    """
+
+    compiled_entities = tuple(
+        entity for entity in snapshot.entities if entity.kind == "compiled_rule"
+    )
+    valid: list[tuple[DesignEntity, Any]] = []
+    invalid_entity_ids: list[str] = []
+    invalid_assertion_ids: list[str] = []
+
+    for entity in compiled_entities:
+        assertions = tuple(
+            assertion
+            for assertion in snapshot.assertions
+            if assertion.subject_id == entity.id
+            and assertion.predicate == "compiles_to"
+        )
+        entity_ir = _validated_rule_ir(entity.attributes.get("ir"))
+        if entity_ir is None or entity_ir.id != entity.id or not assertions:
+            invalid_entity_ids.append(entity.id)
+            invalid_assertion_ids.extend(assertion.id for assertion in assertions)
+            continue
+
+        entity_has_valid_assertion = False
+        for assertion in assertions:
+            asserted_ir = _validated_rule_ir(assertion.value)
+            if (
+                asserted_ir is None
+                or asserted_ir.id != entity.id
+                or asserted_ir != entity_ir
+            ):
+                invalid_assertion_ids.append(assertion.id)
+                continue
+            entity_has_valid_assertion = True
+            valid.append((entity, assertion))
+        if not entity_has_valid_assertion:
+            invalid_entity_ids.append(entity.id)
+
+    usages: list[SemanticUsage] = []
+    if valid:
+        usages.append(
+            SemanticUsage(
+                id="snapshot:compiled-ruleir",
+                origin=SemanticOrigin.COMPILED,
+                description="CNL rules validated as matching typed RuleIR entities and assertions.",
+                rule_ids=tuple(dict.fromkeys(entity.id for entity, _ in valid)),
+                provenance=tuple(
+                    dict.fromkeys(
+                        f"{assertion.provenance.extractor}:{assertion.provenance.location}"
+                        for _, assertion in valid
+                    )
+                ),
+                assertion_ids=tuple(assertion.id for _, assertion in valid),
+                source_revision_ids=tuple(
+                    dict.fromkeys(
+                        assertion.provenance.source_revision_id
+                        for _, assertion in valid
+                    )
+                ),
+            )
+        )
+    if invalid_entity_ids or invalid_assertion_ids:
+        usages.append(
+            SemanticUsage(
+                id="snapshot:invalid-compiled-ruleir",
+                origin=SemanticOrigin.MISSING_AMBIGUOUS,
+                description="Compiled-rule metadata is missing, malformed, or disagrees with its typed RuleIR assertion.",
+                entity_ids=tuple(dict.fromkeys(invalid_entity_ids)),
+                assertion_ids=tuple(dict.fromkeys(invalid_assertion_ids)),
+                provenance=("DesignEntity.attributes.ir", "Assertion.value"),
+            )
+        )
+    return tuple(usages)
+
+
+def _validated_rule_ir(value: Any) -> RuleIR | None:
+    """Reconstruct the exact RuleIR contract from untrusted raw field data.
+
+    A Pydantic instance is not proof that validation ran: ``model_construct`` and
+    subclasses can carry invalid fields. Read only its plain instance storage,
+    bypassing attribute hooks, and make the exact base RuleIR validate every field.
+    """
+
+    raw = (
+        dict(object.__getattribute__(value, "__dict__"))
+        if isinstance(value, BaseModel)
+        else value
+    )
+    try:
+        validated = RuleIR.model_validate(raw)
+    except (ValidationError, TypeError, ValueError):
+        return None
+    if not validated.source.strip():
+        return None
+    return validated
+
+
+def _override_execution_count(
+    key: str,
+    config: SimulationConfig,
+    events: tuple[SimulationEvent, ...],
+) -> int:
+    if key == "starting_cubes":
+        # This function is reached only for explicitly supplied overrides. The map
+        # is consumed into initial state whenever setup completes, including when it
+        # replaces the provisional ruleset's default zero-cube map.
+        return int(any(event.event_type == "scenario.setup" for event in events))
+    if key == "scenario_deck_card_ids":
+        return int(
+            not config.deck_order
+            and any(event.event_type == "scenario.setup" for event in events)
+        )
+    if key == "allow_pass":
+        return sum(
+            event.event_type == "player.action_skipped" for event in events
+        )
+    if key in {"end_turn_pressure", "end_turn_pressure_target"}:
+        return sum(
+            event.event_type == "card.worsened"
+            and event.data.get("source_id") == "cw:experiment:end-turn-pressure"
+            for event in events
+        )
+    return 0
 
 
 def _fields(entity: DesignEntity) -> dict[str, Any]:

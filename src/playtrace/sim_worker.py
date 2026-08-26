@@ -6,35 +6,63 @@ import json
 import sys
 from pathlib import Path
 
-from playtrace.models import DesignSnapshot
-from playtrace.plugins.crisis_wardens import CrisisWardensSimulationPlugin
-from playtrace.simulation import SimulationConfig
+from pydantic import ValidationError
+
+from playtrace.models import DesignSnapshot, StrictModel
+from playtrace.plugins import registry as simulation_plugins
+from playtrace.simulation import (
+    SimulationConfig,
+    SimulationJsonInputError,
+    load_bounded_json_file,
+)
 
 
-PLUGINS = {CrisisWardensSimulationPlugin.id: CrisisWardensSimulationPlugin}
+class SimulationWorkerRequest(StrictModel):
+    plugin_id: str
+    snapshot: DesignSnapshot
+    config: SimulationConfig
+    runner: str = "docker"
+    container_image_digest: str | None = None
 
 
 def main() -> None:
     request_path, output_path = map(Path, sys.argv[1:3])
-    request = json.loads(request_path.read_text(encoding="utf-8"))
-    plugin_type = PLUGINS.get(request["plugin_id"])
-    if plugin_type is None:
-        raise SystemExit(f"unknown simulation plugin: {request['plugin_id']}")
-    result = plugin_type().run(
-        DesignSnapshot.model_validate(request["snapshot"]),
-        SimulationConfig.model_validate(request["config"]),
-        runner=request.get("runner", "docker"),
+    try:
+        request = SimulationWorkerRequest.model_validate(
+            load_bounded_json_file(request_path)
+        )
+    except SimulationJsonInputError as error:
+        raise SystemExit(
+            f"invalid simulation JSON input ({error.category}): {error.message}"
+        ) from error
+    except ValidationError as error:
+        raise SystemExit(f"invalid simulation worker request: {error}") from error
+    try:
+        plugin = simulation_plugins.create(request.plugin_id)
+    except KeyError as error:
+        raise SystemExit(str(error)) from error
+    result = plugin.run(
+        request.snapshot,
+        request.config,
+        runner=request.runner,
     )
     result = result.model_copy(
         update={
             "provenance": result.provenance.model_copy(
                 update={
-                    "container_image_digest": request.get("container_image_digest")
+                    "container_image_digest": request.container_image_digest
                 }
             )
         }
     )
-    output_path.write_text(result.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    rendered = json.dumps(
+        result.model_dump(mode="json"),
+        allow_nan=False,
+        ensure_ascii=False,
+        sort_keys=True,
+        indent=2,
+    )
+    output_path.write_text(rendered + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

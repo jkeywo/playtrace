@@ -94,3 +94,36 @@ def test_simulation_round_trip_and_fts5_search(tmp_path) -> None:
     assert loaded == run
     assert [result["record_id"] for result in results] == [run.id]
     assert counts["simulation_runs"] == 1
+
+
+def test_blocked_simulation_with_semantically_invalid_json_override_round_trips(tmp_path) -> None:
+    snapshot = _snapshot()
+    config = SimulationConfig(
+        id="cw:experiment:malformed-persistence",
+        scenario_id="SCN-001",
+        character_ids=("CHR-001",),
+        ruleset_id="cw:rules:provisional-core-v0.2",
+        deck_order=("SCD-005",),
+        overrides=(
+            SimulationOverride(
+                key="end_turn_pressure_target",
+                value="middle",
+                rationale="Retain this rejection rationale through persistence.",
+            ),
+        ),
+    )
+    run = InProcessSimulationRunner().run(
+        CrisisWardensSimulationPlugin(), snapshot, config
+    )
+
+    with PlayTraceStore(tmp_path / "malformed-simulation.db") as store:
+        store.save_snapshot(snapshot)
+        store.save_simulation(run)
+        loaded = store.load_simulation(run.id)
+
+    assert loaded == run
+    assert loaded is not None
+    override = loaded.config.overrides[0]
+    assert override.rationale == "Retain this rejection rationale through persistence."
+    assert override.value == "middle"
+    assert loaded.blockers[0].id == "cw:blocker:override-end-turn-pressure-target"
