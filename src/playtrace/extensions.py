@@ -13,8 +13,18 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
+from playtrace.canonical import (
+    CANONICAL_IDENTITY_SCHEMA,
+    CANONICAL_IDENTITY_VERSION,
+    canonical_digest,
+)
 from playtrace.models import StrictModel
-from playtrace.simulation import content_digest
+
+
+_CANONICAL_DIGEST_SCHEMA = (
+    f"{CANONICAL_IDENTITY_SCHEMA}/{CANONICAL_IDENTITY_VERSION}"
+)
+_LEGACY_DIGEST_SCHEMA = "legacy-json-sha256-v0"
 
 
 class ExtensionKind(StrEnum):
@@ -61,11 +71,26 @@ class GeneratedExtensionProposal(StrictModel):
     generator: str
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     digest: str
+    digest_schema: str = _LEGACY_DIGEST_SCHEMA
+    canonical_seal: str | None = None
 
     @model_validator(mode="after")
     def bind_content_and_lifecycle(self) -> "GeneratedExtensionProposal":
-        if self.digest != content_digest(self.content_payload()):
-            raise ValueError("extension proposal digest does not match its immutable content")
+        if self.digest_schema == _CANONICAL_DIGEST_SCHEMA:
+            if self.digest != self.expected_content_digest():
+                raise ValueError(
+                    "extension proposal digest does not match its immutable content"
+                )
+            if self.canonical_seal != self.expected_canonical_seal():
+                raise ValueError("extension canonical integrity seal does not match its content")
+        elif self.digest_schema == _LEGACY_DIGEST_SCHEMA:
+            if (
+                self.canonical_seal is not None
+                and self.canonical_seal != self.expected_canonical_seal()
+            ):
+                raise ValueError("extension canonical integrity seal does not match its content")
+        else:
+            raise ValueError(f"unsupported extension digest schema {self.digest_schema!r}")
         if not self.proposed_tests:
             raise ValueError("an extension proposal must include proposed tests")
         if not self.history:
@@ -86,9 +111,46 @@ class GeneratedExtensionProposal(StrictModel):
         """Return generator content, excluding review state and audit history."""
 
         return self.model_dump(
-            mode="json",
-            exclude={"digest", "state", "history", "created_at"},
+            mode="python",
+            exclude={
+                "digest",
+                "canonical_seal",
+                "state",
+                "history",
+                "created_at",
+            },
         )
+
+    def expected_content_digest(self) -> str:
+        return canonical_digest(self.content_payload(), domain="extension-content")
+
+    def expected_canonical_seal(self) -> str:
+        return canonical_digest(
+            {
+                "historical_digest": self.digest,
+                "content": self.content_payload(),
+            },
+            domain="extension-content-integrity",
+        )
+
+
+def extension_integrity_matches(proposal: GeneratedExtensionProposal) -> bool:
+    if proposal.canonical_seal != proposal.expected_canonical_seal():
+        return False
+    if proposal.digest_schema == _CANONICAL_DIGEST_SCHEMA:
+        return proposal.digest == proposal.expected_content_digest()
+    return proposal.digest_schema == _LEGACY_DIGEST_SCHEMA
+
+
+def adopt_legacy_extension(
+    proposal: GeneratedExtensionProposal,
+) -> GeneratedExtensionProposal:
+    if proposal.digest_schema != _LEGACY_DIGEST_SCHEMA or proposal.canonical_seal is not None:
+        return proposal
+    return GeneratedExtensionProposal.model_validate(
+        proposal.model_dump(mode="python")
+        | {"canonical_seal": proposal.expected_canonical_seal()}
+    )
 
 
 _ALLOWED_TRANSITIONS = {
@@ -114,6 +176,8 @@ def propose_extension(**values: object) -> GeneratedExtensionProposal:
     payload.pop("digest", None)
     payload["state"] = ExtensionProposalState.PROPOSED
     payload.setdefault("inert", True)
+    payload["digest_schema"] = _CANONICAL_DIGEST_SCHEMA
+    payload["canonical_seal"] = None
     actor = str(payload.get("generator", ""))
     payload["history"] = (
         ExtensionTransition(
@@ -127,9 +191,15 @@ def propose_extension(**values: object) -> GeneratedExtensionProposal:
     digest_payload = {
         key: value
         for key, value in payload.items()
-        if key not in {"state", "history", "created_at"}
+        if key not in {"digest", "canonical_seal", "state", "history", "created_at"}
     }
-    return GeneratedExtensionProposal(**payload, digest=content_digest(digest_payload))
+    digest = canonical_digest(digest_payload, domain="extension-content")
+    seal = canonical_digest(
+        {"historical_digest": digest, "content": digest_payload},
+        domain="extension-content-integrity",
+    )
+    payload["canonical_seal"] = seal
+    return GeneratedExtensionProposal(**payload, digest=digest)
 
 
 def transition_extension(

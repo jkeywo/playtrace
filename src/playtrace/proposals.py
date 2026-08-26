@@ -9,9 +9,14 @@ from typing import Any
 
 from pydantic import Field, JsonValue, TypeAdapter, model_validator
 
+from playtrace.canonical import (
+    CANONICAL_IDENTITY_SCHEMA,
+    CANONICAL_IDENTITY_VERSION,
+    canonical_digest,
+)
 from playtrace.models import ChangeSet, DecisionState, DesignSnapshot, StrictModel
 from playtrace.patches import SemanticPatchExecutor, SemanticPatchSet
-from playtrace.simulation import content_digest, snapshot_content_digest
+from playtrace.simulation import snapshot_content_digest
 
 
 class ProposalState(StrEnum):
@@ -42,7 +47,7 @@ class ProposalBasis(StrictModel):
     regression_records: dict[str, JsonValue] = Field(default_factory=dict)
 
     def digest(self) -> str:
-        return content_digest(self.model_dump(mode="json"))
+        return canonical_digest(self, domain="proposal-basis")
 
 
 class ProposalPostcondition(StrictModel):
@@ -67,6 +72,8 @@ class DesignProposal(StrictModel):
     patch_set: SemanticPatchSet
     basis: ProposalBasis
     basis_digest: str
+    digest_schema: str = "legacy-json-sha256-v0"
+    canonical_seal: str | None = None
     evidence_ids: tuple[str, ...] = ()
     policy_ids: tuple[str, ...] = ()
     regression_case_ids: tuple[str, ...] = ()
@@ -77,8 +84,21 @@ class DesignProposal(StrictModel):
 
     @model_validator(mode="after")
     def bind_every_input(self) -> "DesignProposal":
-        if self.basis_digest != self.approval_digest():
-            raise ValueError("basis_digest does not match the complete proposal and review basis")
+        if self.digest_schema == canonical_digest_schema():
+            if self.basis_digest != self.approval_digest():
+                raise ValueError(
+                    "basis_digest does not match the complete proposal and review basis"
+                )
+            if self.canonical_seal != self.expected_canonical_seal():
+                raise ValueError("proposal canonical integrity seal does not match its content")
+        elif self.digest_schema == "legacy-json-sha256-v0":
+            if (
+                self.canonical_seal is not None
+                and self.canonical_seal != self.expected_canonical_seal()
+            ):
+                raise ValueError("proposal canonical integrity seal does not match its content")
+        else:
+            raise ValueError(f"unsupported proposal digest schema {self.digest_schema!r}")
         snapshot_id = self.basis.snapshot.id
         if self.project_id != self.basis.snapshot.project_id:
             raise ValueError("proposal project must match the basis snapshot")
@@ -123,12 +143,52 @@ class DesignProposal(StrictModel):
     def approval_digest(self) -> str:
         """Bind everything a human approves, excluding lifecycle metadata."""
 
-        return content_digest(
-            self.model_dump(
-                mode="json",
-                exclude={"basis_digest", "state", "created_at"},
-            )
+        return canonical_digest(
+            self.approval_payload(),
+            domain="proposal-approval",
         )
+
+    def approval_payload(self) -> dict[str, Any]:
+        return self.model_dump(
+            mode="python",
+            exclude={"basis_digest", "canonical_seal", "state", "created_at"},
+        )
+
+    def expected_canonical_seal(self) -> str:
+        return canonical_digest(
+            {
+                "historical_basis_digest": self.basis_digest,
+                "approval": self.approval_payload(),
+            },
+            domain="proposal-approval-integrity",
+        )
+
+
+def canonical_digest_schema() -> str:
+    return f"{CANONICAL_IDENTITY_SCHEMA}/{CANONICAL_IDENTITY_VERSION}"
+
+
+def approval_integrity_matches(proposal: DesignProposal) -> bool:
+    """Central approval-integrity check for application, storage and promotion."""
+
+    if proposal.canonical_seal != proposal.expected_canonical_seal():
+        return False
+    if proposal.digest_schema == canonical_digest_schema():
+        return proposal.basis_digest == proposal.approval_digest()
+    return proposal.digest_schema == "legacy-json-sha256-v0"
+
+
+def adopt_legacy_proposal(proposal: DesignProposal) -> DesignProposal:
+    """Seal one unsealed historical proposal without rewriting its approved digest."""
+
+    if proposal.digest_schema != "legacy-json-sha256-v0":
+        return proposal
+    if proposal.canonical_seal is not None:
+        return proposal
+    return DesignProposal.model_validate(
+        proposal.model_dump(mode="python")
+        | {"canonical_seal": proposal.expected_canonical_seal()}
+    )
 
 
 class ProposalTransition(StrictModel):
@@ -260,6 +320,8 @@ def create_proposal(
         patch_set=patch_set,
         basis=basis,
         basis_digest="",
+        digest_schema=canonical_digest_schema(),
+        canonical_seal=None,
         evidence_ids=tuple(evidence_ids),
         policy_ids=tuple(policy_ids),
         regression_case_ids=tuple(regression_case_ids),
@@ -269,12 +331,25 @@ def create_proposal(
     approval_payload = {
         key: value
         for key, value in values.items()
-        if key not in {"basis_digest", "state", "created_at"}
+        if key not in {"basis_digest", "canonical_seal", "state", "created_at"}
     }
-    approval_digest = content_digest(
-        TypeAdapter(Any).dump_python(approval_payload, mode="json")
+    approval_digest = canonical_digest(
+        TypeAdapter(Any).dump_python(approval_payload, mode="python"),
+        domain="proposal-approval",
     )
-    proposal = DesignProposal(**(values | {"basis_digest": approval_digest}))
+    canonical_seal = canonical_digest(
+        {
+            "historical_basis_digest": approval_digest,
+            "approval": TypeAdapter(Any).dump_python(approval_payload, mode="python"),
+        },
+        domain="proposal-approval-integrity",
+    )
+    proposal = DesignProposal(
+        **(
+            values
+            | {"basis_digest": approval_digest, "canonical_seal": canonical_seal}
+        )
+    )
     return ProposalRecord(
         proposal=proposal,
         history=(
@@ -358,7 +433,7 @@ class ProposalOrchestrator:
                 dry_run=dry_run,
                 message="Preflight failed: only an approved proposal may be dry-run or applied.",
             )
-        if proposal.basis_digest != proposal.approval_digest():
+        if not approval_integrity_matches(proposal):
             return _append_preflight_failure(
                 record,
                 actor=actor,

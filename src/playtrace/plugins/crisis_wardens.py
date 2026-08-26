@@ -10,6 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+from playtrace.canonical import canonical_digest
 from playtrace.cnl import RuleIR
 from playtrace.models import DesignEntity, DesignSnapshot
 from playtrace.plugins.registry import register_simulation_plugin
@@ -35,7 +36,6 @@ from playtrace.simulation import (
     SimulationRun,
     SimulationStatus,
     TabletopSimulationState,
-    content_digest,
     snapshot_content_digest,
 )
 
@@ -436,7 +436,12 @@ class CrisisWardensSimulationPlugin:
                 for entity in entities
                 for _ in range(int(str(_fields(entity).get("Qty", "1") or "1")))
             ]
-            seed = int(content_digest([config.seed, character_id])[:16], 16)
+            seed = int(
+                canonical_digest(
+                    [config.seed, character_id], domain="simulation-rng-seed"
+                )[:16],
+                16,
+            )
             random.Random(seed).shuffle(deck)
             hand, remaining = deck[:3], deck[3:]
             players[character_id] = PlayerSimulationState(
@@ -471,12 +476,13 @@ class CrisisWardensSimulationPlugin:
                     )
                 )
         provenance = _provenance(snapshot, config, self, runner)
-        identity = content_digest(
+        identity = canonical_digest(
             {
                 "provenance": provenance.model_dump(mode="json", exclude={"observed_at"}),
                 "blockers": [item.model_dump(mode="json") for item in blockers],
                 "semantic_audit": audit.model_dump(mode="json"),
-            }
+            },
+            domain="simulation-run-id",
         )[:20]
         return SimulationRun(
             id=f"{snapshot.project_id}:simulation:{identity}",
@@ -659,7 +665,13 @@ class _Runtime:
 
     def _rest(self, actor_id: str) -> None:
         player = self.players[actor_id]
-        seed = int(content_digest([self.config.seed, actor_id, self.turn, "rest"])[:16], 16)
+        seed = int(
+            canonical_digest(
+                [self.config.seed, actor_id, self.turn, "rest"],
+                domain="simulation-rng-seed",
+            )[:16],
+            16,
+        )
         random.Random(seed).shuffle(player["discard"])
         player["deck"] = player["discard"]
         player["discard"] = []
@@ -670,7 +682,13 @@ class _Runtime:
     def _choose_activation(self, actor_id: str) -> str:
         hand = self.players[actor_id]["hand"]
         if self.config.player_policy is PlayerPolicyKind.RANDOM_CONSTRAINED:
-            seed = int(content_digest([self.config.seed, actor_id, self.turn, "activation"])[:16], 16)
+            seed = int(
+                canonical_digest(
+                    [self.config.seed, actor_id, self.turn, "activation"],
+                    domain="simulation-rng-seed",
+                )[:16],
+                16,
+            )
             return random.Random(seed).choice(sorted(hand))
         return sorted(
             hand,
@@ -1378,13 +1396,14 @@ class _Runtime:
             ),
             strict=self.config.strict_semantics,
         )
-        identity = content_digest(
+        identity = canonical_digest(
             {
                 "provenance": provenance.model_dump(mode="json", exclude={"observed_at"}),
                 "events": [item.model_dump(mode="json") for item in self.events],
                 "final": final.model_dump(mode="json"),
                 "semantic_audit": audit.model_dump(mode="json"),
-            }
+            },
+            domain="simulation-run-id",
         )[:20]
         return SimulationRun(
             id=f"{self.snapshot.project_id}:simulation:{identity}",
@@ -1416,7 +1435,7 @@ def _provenance(
         backend_version=backend_version,
         plugin_id=plugin.id,
         plugin_version=plugin.version,
-        config_digest=content_digest(config),
+        config_digest=canonical_digest(config, domain="simulation-config"),
         player_policy=config.player_policy,
         seeds=(config.seed,),
         runner=runner,

@@ -9,6 +9,7 @@ from typing import Iterable
 
 from pydantic import Field, model_validator
 
+from playtrace.canonical import canonical_digest
 from playtrace.models import (
     DesignSnapshot,
     EvidenceClaim,
@@ -19,7 +20,6 @@ from playtrace.models import (
 )
 from playtrace.simulation import (
     SimulationRun,
-    content_digest,
     snapshot_content_digest,
 )
 from playtrace.tension import ABComparison, TensionBatch, compare_batches
@@ -267,11 +267,11 @@ def simulation_evidence(
         scope=(run.config.scenario_id, *run.config.character_ids),
         assumptions=all_assumptions,
         provenance=ExperimentArtifactProvenance(
-            artifact_digest=content_digest(run.model_dump(mode="json")),
+            artifact_digest=canonical_digest(run, domain="simulation-run-artifact"),
             artifact_path=str(artifact_path) if artifact_path else None,
             source_result_ids=(run.id,),
             source_artifact_digests={
-                run.id: content_digest(run.model_dump(mode="json"))
+                run.id: canonical_digest(run, domain="simulation-run-artifact")
             },
             snapshot_ids=(run.provenance.snapshot_id,),
             snapshot_digests=(run.provenance.snapshot_digest,),
@@ -387,12 +387,18 @@ def ab_comparison_evidence(
         scope=tuple(item.combination for item in comparison.deltas),
         assumptions=assumptions,
         provenance=ExperimentArtifactProvenance(
-            artifact_digest=content_digest(comparison.model_dump(mode="json")),
+            artifact_digest=canonical_digest(
+                comparison, domain="tension-comparison-artifact"
+            ),
             artifact_path=str(artifact_path) if artifact_path else None,
             source_result_ids=(baseline.id, candidate.id),
             source_artifact_digests={
-                baseline.id: content_digest(baseline.model_dump(mode="json")),
-                candidate.id: content_digest(candidate.model_dump(mode="json")),
+                baseline.id: canonical_digest(
+                    baseline, domain="tension-batch-artifact"
+                ),
+                candidate.id: canonical_digest(
+                    candidate, domain="tension-batch-artifact"
+                ),
             },
             snapshot_ids=tuple(dict.fromkeys((*baseline.snapshot_ids, *candidate.snapshot_ids))),
             snapshot_digests=tuple(dict.fromkeys((*baseline.snapshot_digests, *candidate.snapshot_digests))),
@@ -421,7 +427,7 @@ def _batch_provenance(
     batch: TensionBatch, artifact_path: str | Path | None
 ) -> ExperimentArtifactProvenance:
     return ExperimentArtifactProvenance(
-        artifact_digest=content_digest(batch.model_dump(mode="json")),
+        artifact_digest=canonical_digest(batch, domain="tension-batch-artifact"),
         artifact_path=str(artifact_path) if artifact_path else None,
         source_result_ids=batch.source_run_ids,
         snapshot_ids=batch.snapshot_ids,

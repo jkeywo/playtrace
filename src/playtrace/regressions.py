@@ -9,12 +9,16 @@ from typing import Any, Protocol
 
 from pydantic import Field, JsonValue, model_validator
 
+from playtrace.canonical import (
+    CANONICAL_IDENTITY_SCHEMA,
+    CANONICAL_IDENTITY_VERSION,
+    canonical_digest,
+)
 from playtrace.models import DecisionState, DesignSnapshot, StrictModel
 from playtrace.simulation import (
     InProcessSimulationRunner,
     SimulationConfig,
     SimulationRun,
-    content_digest,
     snapshot_content_digest,
 )
 
@@ -84,16 +88,17 @@ class BehavioralRegressionCase(StrictModel):
         return self
 
     def digest(self) -> str:
-        return content_digest(self.model_dump(mode="json"))
+        return canonical_digest(self, domain="regression-case")
 
     def content_digest(self) -> str:
         """Digest immutable case content independently of its approval decision."""
 
-        return content_digest(
+        return canonical_digest(
             self.model_dump(
-                mode="json",
+                mode="python",
                 exclude={"state", "approval", "source_proposal_id"},
-            )
+            ),
+            domain="regression-case-content",
         )
 
 
@@ -172,7 +177,7 @@ class BehavioralRegressionSuite(StrictModel):
         return self
 
     def digest(self) -> str:
-        return content_digest(self.model_dump(mode="json"))
+        return canonical_digest(self, domain="regression-suite")
 
 
 class RegressionCaseResult(StrictModel):
@@ -191,13 +196,63 @@ class RegressionSuiteRun(StrictModel):
     passed: bool
     case_results: tuple[RegressionCaseResult, ...]
     digest: str
+    digest_schema: str = "legacy-json-sha256-v0"
+    canonical_seal: str | None = None
 
     @model_validator(mode="after")
     def digest_matches_payload(self) -> "RegressionSuiteRun":
-        payload = self.model_dump(mode="json", exclude={"digest"})
-        if self.digest != content_digest(payload):
-            raise ValueError("regression suite run digest does not match its results")
+        canonical_schema = (
+            f"{CANONICAL_IDENTITY_SCHEMA}/{CANONICAL_IDENTITY_VERSION}"
+        )
+        if self.digest_schema == canonical_schema:
+            if self.digest != self.expected_digest():
+                raise ValueError("regression suite run digest does not match its results")
+            if self.canonical_seal != self.expected_canonical_seal():
+                raise ValueError("regression run canonical integrity seal does not match")
+        elif self.digest_schema == "legacy-json-sha256-v0":
+            if (
+                self.canonical_seal is not None
+                and self.canonical_seal != self.expected_canonical_seal()
+            ):
+                raise ValueError("regression run canonical integrity seal does not match")
+        else:
+            raise ValueError(f"unsupported regression digest schema {self.digest_schema!r}")
         return self
+
+    def digest_payload(self) -> dict[str, Any]:
+        return self.model_dump(
+            mode="python", exclude={"digest", "canonical_seal"}
+        )
+
+    def expected_digest(self) -> str:
+        return canonical_digest(self.digest_payload(), domain="regression-run")
+
+    def expected_canonical_seal(self) -> str:
+        return canonical_digest(
+            {
+                "historical_digest": self.digest,
+                "results": self.digest_payload(),
+            },
+            domain="regression-run-integrity",
+        )
+
+
+def regression_run_integrity_matches(run: RegressionSuiteRun) -> bool:
+    if run.canonical_seal != run.expected_canonical_seal():
+        return False
+    canonical_schema = f"{CANONICAL_IDENTITY_SCHEMA}/{CANONICAL_IDENTITY_VERSION}"
+    if run.digest_schema == canonical_schema:
+        return run.digest == run.expected_digest()
+    return run.digest_schema == "legacy-json-sha256-v0"
+
+
+def adopt_legacy_regression_run(run: RegressionSuiteRun) -> RegressionSuiteRun:
+    if run.digest_schema != "legacy-json-sha256-v0" or run.canonical_seal is not None:
+        return run
+    return RegressionSuiteRun.model_validate(
+        run.model_dump(mode="python")
+        | {"canonical_seal": run.expected_canonical_seal()}
+    )
 
 
 class PluginRegistry(Protocol):
@@ -254,8 +309,22 @@ class BehavioralRegressionRunner:
             "snapshot_id": snapshot.id,
             "passed": all(item.passed for item in results),
             "case_results": tuple(results),
+            "digest_schema": (
+                f"{CANONICAL_IDENTITY_SCHEMA}/{CANONICAL_IDENTITY_VERSION}"
+            ),
         }
-        return RegressionSuiteRun(**base, digest=content_digest(_json(base)))
+        digest_payload = {
+            **base,
+            "case_results": tuple(item.model_dump(mode="python") for item in results),
+        }
+        digest = canonical_digest(digest_payload, domain="regression-run")
+        seal = canonical_digest(
+            {"historical_digest": digest, "results": digest_payload},
+            domain="regression-run-integrity",
+        )
+        return RegressionSuiteRun(
+            **base, digest=digest, canonical_seal=seal
+        )
 
 
 def stable_run_digest(run: SimulationRun) -> str:
@@ -263,7 +332,7 @@ def stable_run_digest(run: SimulationRun) -> str:
 
     payload = run.model_dump(mode="json")
     payload["provenance"].pop("observed_at", None)
-    return content_digest(payload)
+    return canonical_digest(payload, domain="simulation-run-artifact")
 
 
 def _compare_run(run: SimulationRun, expected: RegressionExpectation) -> tuple[str, ...]:

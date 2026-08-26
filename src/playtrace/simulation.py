@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import subprocess
@@ -15,6 +14,7 @@ from typing import Any, Protocol
 from pydantic import BaseModel, Field, JsonValue, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 
+from playtrace.canonical import canonical_digest
 from playtrace.models import (
     DesignSnapshot,
     EvidenceClaim,
@@ -505,19 +505,9 @@ class DockerSimulationRunner:
 
 
 def content_digest(value: Any) -> str:
-    """Return a stable digest for an internal JSON-compatible value or model."""
+    """Compatibility wrapper for generic, versioned Play Trace identities."""
 
-    if isinstance(value, BaseModel):
-        value = value.model_dump(mode="json")
-    return hashlib.sha256(
-        json.dumps(
-            value,
-            allow_nan=False,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8", errors="strict")
-    ).hexdigest()
+    return canonical_digest(value, domain="generic-content")
 
 
 def _require_simulation_config(config: object) -> None:
@@ -895,7 +885,7 @@ def snapshot_content_digest(snapshot: DesignSnapshot) -> str:
         revision.pop("observed_at", None)
     for assertion in payload["assertions"]:
         assertion["provenance"].pop("extracted_at", None)
-    return content_digest(payload)
+    return canonical_digest(payload, domain="design-snapshot")
 
 
 from playtrace.semantics import SemanticAudit  # noqa: E402  (forward model rebuild)

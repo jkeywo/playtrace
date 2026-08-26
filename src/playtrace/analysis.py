@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections import Counter
 
 from pydantic import Field
 
+from playtrace.canonical import canonical_digest
 from playtrace.dependencies import DependencyGraph
 from playtrace.models import AuthoredStatus, DesignSnapshot, StrictModel
 
@@ -129,6 +128,4 @@ class SnapshotAnalyzer:
             "capabilities": sorted(snapshot.capabilities),
             "omissions": snapshot.omissions,
         }
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
-
+        return canonical_digest(payload, domain="analysis-semantic")

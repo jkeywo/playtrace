@@ -268,7 +268,11 @@ def promote_applied_proposal(
 ) -> tuple[PrecedentCase, Path]:
     """Explicitly write one applied decision into its owning game's case library."""
 
-    from playtrace.proposals import AttemptStatus, ProposalState
+    from playtrace.proposals import (
+        AttemptStatus,
+        ProposalState,
+        approval_integrity_matches,
+    )
 
     proposal = record.proposal
     if proposal.state is not ProposalState.APPLIED:
@@ -280,7 +284,7 @@ def promote_applied_proposal(
         raise ValueError(
             "precedent promotion requires a successful canonical application attempt"
         )
-    if proposal.basis_digest != proposal.approval_digest():
+    if not approval_integrity_matches(proposal):
         raise ValueError("proposal content does not match its approved basis digest")
     root = Path(game_root).resolve()
     destination = (root / "design" / "cases" / f"{_safe_name(proposal.id)}.json").resolve()

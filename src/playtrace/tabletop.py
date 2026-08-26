@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from playtrace.canonical import canonical_digest
 from playtrace.cnl import RuleIR, TabletopRuleCompiler
 from playtrace.docs_adapter import extract_document_records
 from playtrace.manifest import ProjectManifest, WorkspaceSourceKind, load_manifest
@@ -80,9 +79,13 @@ class TabletopProjectAdapter:
                 entities.extend(records.entities)
                 assertions.extend(records.assertions)
 
-        snapshot_digest = hashlib.sha256(
-            "\0".join(f"{item.id}:{item.content_digest}" for item in revisions).encode("utf-8")
-        ).hexdigest()[:20]
+        snapshot_digest = canonical_digest(
+            [
+                {"id": item.id, "content_digest": item.content_digest}
+                for item in revisions
+            ],
+            domain="tabletop-snapshot-id",
+        )[:20]
         return DesignSnapshot(
             id=f"{self.manifest.project_id}:snapshot:{snapshot_digest}",
             project_id=self.manifest.project_id,
@@ -210,9 +213,7 @@ class TabletopProjectAdapter:
     ) -> SourceRevision:
         modified = metadata.get("modifiedTime")
         observed = datetime.fromisoformat(modified.replace("Z", "+00:00")) if modified else datetime.now(UTC)
-        digest = hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
-        ).hexdigest()
+        digest = canonical_digest(payload, domain="source-revision-content")
         return SourceRevision(
             id=f"{source_id}@{provider_revision}",
             source_id=source_id,

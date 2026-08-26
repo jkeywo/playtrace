@@ -169,6 +169,15 @@ generated content has a separate digest from its append-only review lifecycle
 (`proposed`, `pending`, `approved`, `rejected`, or `revise`). It cannot
 dynamically register, compile, load, or execute source text.
 
+### ArtifactIntegrity
+
+The storage-owned integrity sidecar for durable proposals, extension proposals,
+and regression runs. Its `(kind, id)` identity maps to one digest schema and
+one canonical seal outside the artifact's mutable JSON payload. First legacy
+adoption writes the sealed payload and sidecar transactionally; every later
+load requires both representations to agree. This prevents removal of an
+embedded seal or a schema downgrade from reopening legacy adoption.
+
 ## Separate dimensions that must not be collapsed
 
 | Dimension | Question |

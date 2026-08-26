@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
 from dataclasses import dataclass
 from typing import Any
 
+from playtrace.canonical import canonical_digest
 from playtrace.models import (
     Assertion,
     AuthoredStatus,
@@ -75,9 +75,14 @@ def extract_document_records(
                 identity_origin = "explicit"
                 text = STABLE_ID_PATTERN.sub("", text, count=1)
             else:
-                fingerprint = hashlib.sha256(
-                    f"{source_id}\0{tab_id}\0{text.strip()}".encode("utf-8")
-                ).hexdigest()[:16]
+                fingerprint = canonical_digest(
+                    {
+                        "source_id": source_id,
+                        "tab_id": tab_id,
+                        "text": text.strip(),
+                    },
+                    domain="document-paragraph-id",
+                )[:16]
                 entity_id = f"{source_id}:paragraph:{fingerprint}"
                 identity_origin = "derived"
 

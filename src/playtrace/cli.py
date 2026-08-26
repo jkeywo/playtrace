@@ -9,6 +9,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from playtrace.canonical import canonical_digest
 from playtrace.adapters import SyntheticProjectAdapter
 from playtrace.analysis import SnapshotAnalyzer
 from playtrace.demo import build_demo_review
@@ -36,7 +37,6 @@ from playtrace.simulation import (
     SimulationConfig,
     SimulationJsonInputError,
     SimulationRun,
-    content_digest,
     load_bounded_json_file,
 )
 from playtrace.simulation_report import write_simulation_report
@@ -337,7 +337,9 @@ def main() -> None:
                                 passed=False,
                                 case_ids=(case_id,),
                                 failed_case_ids=(case_id,),
-                                digest=content_digest({"missing": case_id}),
+                                digest=canonical_digest(
+                                    {"missing": case_id}, domain="regression-outcome"
+                                ),
                             ),
                         )
                     try:
@@ -349,8 +351,9 @@ def main() -> None:
                                 passed=False,
                                 case_ids=(case_id,),
                                 failed_case_ids=(case_id,),
-                                digest=content_digest(
-                                    {"invalid_case_origin": case_id, "error": str(error)}
+                                digest=canonical_digest(
+                                    {"invalid_case_origin": case_id, "error": str(error)},
+                                    domain="regression-outcome",
                                 ),
                             ),
                         )
@@ -362,8 +365,9 @@ def main() -> None:
                                 passed=False,
                                 case_ids=(case_id,),
                                 failed_case_ids=(case_id,),
-                                digest=content_digest(
-                                    {"basis_mismatch": case_id, "actual": case.model_dump(mode="json")}
+                                digest=canonical_digest(
+                                    {"basis_mismatch": case_id, "actual": case},
+                                    domain="regression-outcome",
                                 ),
                             ),
                         )
