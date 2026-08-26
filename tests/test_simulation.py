@@ -316,6 +316,51 @@ def test_strict_semantics_blocks_provisional_ruleset_before_play() -> None:
     assert "cw:rules:provisional-core-v0.2" in run.semantic_audit.blocking_usage_ids
 
 
+def test_core_ruleset_rejects_placeholder_source_content() -> None:
+    config = _config(
+        ruleset_id="cw:rules:core-v0.2",
+        player_policy=PlayerPolicyKind.GREEDY,
+        strict_semantics=True,
+        deck_order=("SCD-005",),
+    )
+
+    run = InProcessSimulationRunner().run(
+        CrisisWardensSimulationPlugin(), _snapshot(), config
+    )
+
+    assert run.final_state is None
+    blocker = next(
+        item
+        for item in run.blockers
+        if item.id == "cw:blocker:core-rules-source-status"
+    )
+    assert set(blocker.entity_ids) == {"SCN-001", "SCD-002", "SCD-003", "SCD-011"}
+
+
+def test_core_ruleset_runs_strictly_without_provisional_semantics() -> None:
+    config = _config(
+        ruleset_id="cw:rules:core-v0.2",
+        player_policy=PlayerPolicyKind.GREEDY,
+        strict_semantics=True,
+        deck_order=("SCD-005",),
+    )
+
+    run = InProcessSimulationRunner().run(
+        CrisisWardensSimulationPlugin(), _canonical_snapshot(), config
+    )
+
+    assert run.blockers == ()
+    assert run.final_state.status is SimulationStatus.WON
+    assert run.semantic_audit.passed
+    assert not any(
+        usage.origin.value == "provisional_override"
+        for usage in run.semantic_audit.usages
+    )
+    assert not any(
+        event.event_type == "provisional.effect_applied" for event in run.events
+    )
+
+
 def test_strict_semantics_allows_compiled_contract_and_registered_extensions() -> None:
     config = _config(
         strict_semantics=True,
@@ -1389,3 +1434,44 @@ def _snapshot() -> DesignSnapshot:
         assertions=(),
         capabilities=frozenset({"simulation_generated", "replay_deterministic"}),
     )
+
+
+def _canonical_snapshot() -> DesignSnapshot:
+    snapshot = _snapshot()
+    canonical_fields = {
+        "SCN-001": {
+            "Front: Escalation": (
+                "Rising → Flooding → Emergency → Catastrophic. When escalation "
+                "advances to Emergency, Worsen each tableau card once. In "
+                "Emergency, resolve each Event twice. Reaching Catastrophic is "
+                "an immediate loss and takes priority over victory."
+            ),
+        },
+        "SCD-002": {
+            "Rules Text": (
+                "At 4 Damage, interrupt the current action: discard this card, "
+                "each responder suffers 1 Fatigue, then advance escalation. "
+                "Resume the interrupted action if the game has not ended."
+            ),
+        },
+        "SCD-003": {
+            "Rules Text": (
+                "At 4 Risk, interrupt the current action: add Panicked "
+                "Evacuation with 2 Disorder, or Worsen it if already present. "
+                "Resume the interrupted action if the game has not ended."
+            ),
+        },
+        "SCD-011": {"Status": "WORKING"},
+    }
+    entities = []
+    for entity in snapshot.entities:
+        updates = canonical_fields.get(entity.id)
+        if not updates:
+            entities.append(entity)
+            continue
+        attributes = dict(entity.attributes)
+        fields = dict(attributes["fields"])
+        fields.update(updates)
+        attributes["fields"] = fields
+        entities.append(entity.model_copy(update={"attributes": attributes}))
+    return snapshot.model_copy(update={"entities": tuple(entities)})

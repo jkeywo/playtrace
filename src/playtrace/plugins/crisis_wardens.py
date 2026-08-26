@@ -83,8 +83,9 @@ _PROVISIONAL_PLACEHOLDER_EFFECT_ID = "cw:provisional:placeholder-effects"
 @register_simulation_plugin
 class CrisisWardensSimulationPlugin:
     id = "crisis-wardens-tabletop"
-    version = "0.3.0"
+    version = "0.4.0"
     project_ids = ("crisis-wardens",)
+    core_ruleset = "cw:rules:core-v0.2"
     provisional_ruleset = "cw:rules:provisional-core-v0.2"
 
     def run(
@@ -94,11 +95,13 @@ class CrisisWardensSimulationPlugin:
         assertions = {assertion.id: assertion for assertion in snapshot.assertions}
         blockers: list[SimulationBlocker] = []
         overrides = config.override_map()
-        provisional = config.ruleset_id == self.provisional_ruleset
+        legacy_provisional = config.ruleset_id == self.provisional_ruleset
+        core_rules = config.ruleset_id == self.core_ruleset
+        complete_rules = legacy_provisional or core_rules
         blockers.extend(_override_configuration_blockers(config))
         if blockers:
             return self._blocked(snapshot, config, runner, blockers)
-        if config.ruleset_id and not provisional:
+        if config.ruleset_id and not complete_rules:
             blockers.append(
                 _blocker(
                     "ruleset",
@@ -133,16 +136,16 @@ class CrisisWardensSimulationPlugin:
                     missing_characters,
                 )
             )
-        if provisional and not 1 <= len(config.character_ids) <= 2:
+        if complete_rules and not 1 <= len(config.character_ids) <= 2:
             blockers.append(
                 _blocker(
                     "player-count",
                     BlockerKind.INVALID_CONFIGURATION,
-                    "The provisional game supports one or two responders; four-player rules are reserved until more characters exist.",
+                    "The current game supports one or two responders; four-player rules are reserved until more characters exist.",
                     config.character_ids,
                 )
             )
-        if provisional:
+        if complete_rules:
             missing_decks = tuple(
                 character_id
                 for character_id in config.character_ids
@@ -204,7 +207,7 @@ class CrisisWardensSimulationPlugin:
             )
         starting_cubes = (
             {card_id: 0 for card_id in starting_ids}
-            if provisional and supplied_starting_cubes is None
+            if complete_rules and supplied_starting_cubes is None
             else supplied_starting_cubes
         )
         if not isinstance(starting_cubes, dict):
@@ -232,7 +235,39 @@ class CrisisWardensSimulationPlugin:
                     overridable=True,
                 )
             )
-        deck = self._deck(config, cards, overrides, blockers, provisional=provisional)
+        if core_rules:
+            core_entities = (
+                scenario,
+                *cards.values(),
+                *(entities[item] for item in config.character_ids),
+                *(
+                    entity
+                    for entity in snapshot.entities
+                    if entity.kind == "character_card"
+                    and str(_fields(entity).get("Character ID", ""))
+                    in config.character_ids
+                ),
+            )
+            unresolved = tuple(
+                entity.id
+                for entity in core_entities
+                if any(
+                    "PLACEHOLDER" in str(value).upper()
+                    for value in _fields(entity).values()
+                )
+            )
+            if unresolved:
+                blockers.append(
+                    _blocker(
+                        "core-rules-source-status",
+                        BlockerKind.MISSING_SOURCE_FACT,
+                        "The canonical core ruleset still references PLACEHOLDER source content.",
+                        unresolved,
+                        required_input="Promote or remove every placeholder used by the core ruleset.",
+                    )
+                )
+
+        deck = self._deck(config, cards, overrides, blockers, provisional=complete_rules)
         if blockers:
             return self._blocked(snapshot, config, runner, blockers)
 
@@ -280,7 +315,7 @@ class CrisisWardensSimulationPlugin:
             deck=deck,
             tableau={card_id: int(starting_cubes[card_id]) for card_id in starting_ids},
             cube_meanings=cube_meanings,
-            players=self._players(snapshot, config) if provisional else {},
+            players=self._players(snapshot, config) if complete_rules else {},
             status=SimulationStatus.READY,
         )
         runtime = _Runtime(
@@ -291,7 +326,7 @@ class CrisisWardensSimulationPlugin:
             assertions=assertions,
             escalation=escalation,
             state=initial,
-            provisional=provisional,
+            provisional=complete_rules,
         )
         runtime.emit(
             "simulation.started",
@@ -320,13 +355,13 @@ class CrisisWardensSimulationPlugin:
             runtime.turn += 1
             actor = config.character_ids[runtime.active_player] if config.character_ids else None
             runtime.emit("turn.started", actor_id=actor)
-            if provisional and config.player_policy in {
+            if complete_rules and config.player_policy in {
                 PlayerPolicyKind.GREEDY,
                 PlayerPolicyKind.RISK_AVERSE,
                 PlayerPolicyKind.RANDOM_CONSTRAINED,
             }:
                 runtime.take_player_turn(actor)
-            elif provisional and config.player_policy is PlayerPolicyKind.SCRIPTED:
+            elif complete_rules and config.player_policy is PlayerPolicyKind.SCRIPTED:
                 assert actor is not None
                 step, blocker = runtime.scripted_policy.consume(
                     turn=runtime.turn,
@@ -1124,11 +1159,12 @@ class _Runtime:
             )
         elif card_id == "SCD-011":
             if self.provisional:
-                self.emit(
-                    "provisional.effect_applied",
-                    entity_ids=(card_id,),
-                    semantic_ids=(_PROVISIONAL_PLACEHOLDER_EFFECT_ID,),
-                )
+                if self.config.ruleset_id == CrisisWardensSimulationPlugin.provisional_ruleset:
+                    self.emit(
+                        "provisional.effect_applied",
+                        entity_ids=(card_id,),
+                        semantic_ids=(_PROVISIONAL_PLACEHOLDER_EFFECT_ID,),
+                    )
                 target = self._highest_cubes("Hazard")
                 if target:
                     self.improve(target, source_id=card_id)
@@ -1286,23 +1322,29 @@ class _Runtime:
         elif card_id == "SCD-004":
             self.advance_escalation(card_id)
         elif self.provisional and card_id == "SCD-002":
-            self.emit(
-                "provisional.effect_applied",
-                entity_ids=(card_id,),
-                semantic_ids=(_PROVISIONAL_PLACEHOLDER_EFFECT_ID,),
-            )
+            if self.config.ruleset_id == CrisisWardensSimulationPlugin.provisional_ruleset:
+                self.emit(
+                    "provisional.effect_applied",
+                    entity_ids=(card_id,),
+                    semantic_ids=(_PROVISIONAL_PLACEHOLDER_EFFECT_ID,),
+                )
             del self.tableau[card_id]
             del self.cube_meanings[card_id]
-            self.emit("tableau.card_collapsed", entity_ids=(card_id,), data={"provisional_effect": "discard, fatigue each responder, escalate"})
+            self.emit(
+                "tableau.card_collapsed",
+                entity_ids=(card_id,),
+                data={"effect": "discard, fatigue each responder, escalate"},
+            )
             for actor_id in self.config.character_ids:
                 self.fatigue(actor_id, 1, source_id=card_id)
             self.advance_escalation(card_id)
         elif self.provisional and card_id == "SCD-003":
-            self.emit(
-                "provisional.effect_applied",
-                entity_ids=(card_id,),
-                semantic_ids=(_PROVISIONAL_PLACEHOLDER_EFFECT_ID,),
-            )
+            if self.config.ruleset_id == CrisisWardensSimulationPlugin.provisional_ruleset:
+                self.emit(
+                    "provisional.effect_applied",
+                    entity_ids=(card_id,),
+                    semantic_ids=(_PROVISIONAL_PLACEHOLDER_EFFECT_ID,),
+                )
             if "SCD-004" in self.tableau:
                 self.worsen("SCD-004", source_id=card_id)
             else:
@@ -1311,11 +1353,12 @@ class _Runtime:
                 self.cube_meanings["SCD-004"] = str(_fields(self.cards["SCD-004"]).get("Cube Meaning", "Disorder"))
                 self.emit("tableau.card_added", entity_ids=("SCD-004",), data={"cubes": 2, "source_id": card_id})
         elif self.provisional and card_id == "SCD-008":
-            self.emit(
-                "provisional.effect_applied",
-                entity_ids=(card_id,),
-                semantic_ids=(_PROVISIONAL_PLACEHOLDER_EFFECT_ID,),
-            )
+            if self.config.ruleset_id == CrisisWardensSimulationPlugin.provisional_ruleset:
+                self.emit(
+                    "provisional.effect_applied",
+                    entity_ids=(card_id,),
+                    semantic_ids=(_PROVISIONAL_PLACEHOLDER_EFFECT_ID,),
+                )
             targets = tuple(item for item in self.tableau if self._has_keyword(item, "Structure"))
             for target in targets:
                 if self.status is SimulationStatus.RUNNING:

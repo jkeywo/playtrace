@@ -285,7 +285,7 @@ class SimulationRun(StrictModel):
 
     def evidence_claim(self) -> EvidenceClaim:
         ruleset_note = (
-            f" using provisional ruleset {self.config.ruleset_id}"
+            f" using ruleset {self.config.ruleset_id}"
             if self.config.ruleset_id
             else ""
         )
