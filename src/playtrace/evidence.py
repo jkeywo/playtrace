@@ -26,6 +26,7 @@ from playtrace.tension import ABComparison, TensionBatch, compare_batches
 
 
 class ExperimentEvidenceKind(StrEnum):
+    TELEMETRY_RUN = "telemetry_run"
     SIMULATION_RUN = "simulation_run"
     TENSION_BATCH = "tension_batch"
     AB_COMPARISON = "ab_comparison"

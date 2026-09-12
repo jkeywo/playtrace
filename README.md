@@ -13,6 +13,12 @@ while a game is being discovered, not only after it has become a specification.
 
 ## Current milestone
 
+A first [local Unreal source and telemetry pilot](docs/unreal.md) supports
+`snapshot --local`, `validate-telemetry` and hypothesis-linked
+`record-experiment --telemetry`. Dread Meridian supplies the game-owned combat
+sandbox; Play Trace preserves source uncertainty, provenance and omitted semantics.
+This does not add full-game simulation or native-asset patching.
+
 **M6: local-first production hardening is implemented.** Versioned SQLite
 migrations, authoritative revision-aware Workspace caching, durable canonical
 write sagas, typed bounded critic fallback, a loopback-only unified review API,

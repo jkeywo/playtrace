@@ -80,6 +80,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="playtrace")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    telemetry_check = subparsers.add_parser("validate-telemetry", help="validate local Unreal JSONL evidence without importing it")
+    telemetry_check.add_argument("capture", type=Path)
+
     demo = subparsers.add_parser("demo", help="analyse and persist the synthetic M0 snapshot")
     demo.add_argument("--medium", choices=[item.value for item in SourceMedium], default="synthetic")
     demo.add_argument("--db", type=Path, default=Path(".playtrace/playtrace.db"))
@@ -157,10 +160,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     snapshot = subparsers.add_parser(
-        "snapshot", help="build a tabletop snapshot from a game repository"
+        "snapshot", help="build a Workspace or local Unreal snapshot from a game repository"
     )
     snapshot.add_argument("project", type=Path)
     source = snapshot.add_mutually_exclusive_group(required=True)
+    source.add_argument("--local", action="store_true", help="read a v2 unreal-local manifest without Google access")
     source.add_argument("--fixture", type=Path, help="replay a captured Workspace payload")
     source.add_argument(
         "--access-token-env",
@@ -236,7 +240,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     record = subparsers.add_parser(
         "record-experiment",
-        help="record a simulation or tension result as hypothesis-linked evidence",
+        help="record simulation, tension or Unreal telemetry as hypothesis-linked evidence",
     )
     record.add_argument("project", type=Path)
     record.add_argument("--snapshot", type=Path, required=True)
@@ -245,6 +249,7 @@ def build_parser() -> argparse.ArgumentParser:
     result.add_argument("--simulation", type=Path)
     result.add_argument("--batch", type=Path)
     result.add_argument("--comparison", type=Path)
+    result.add_argument("--telemetry", type=Path, help="import a versioned Unreal server JSONL capture")
     record.add_argument("--baseline", type=Path)
     record.add_argument("--candidate", type=Path)
     record.add_argument(
@@ -364,6 +369,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+
+    if args.command == "validate-telemetry":
+        from collections import Counter
+        from playtrace.unreal import load_unreal_capture
+        try:
+            capture = load_unreal_capture(args.capture)
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"Telemetry rejected: {error}") from error
+        print(json.dumps({"run_id": capture.events[0].run_id, "artifact_digest": capture.artifact_digest,
+            "run_kind": capture.events[0].data["run_kind"], "outcome": capture.events[-1].data["outcome"],
+            "event_count": len(capture.events), "event_counts": dict(Counter(e.event_type for e in capture.events))}, indent=2))
+        return
 
     if args.command == "migrate":
         try:
@@ -800,7 +817,17 @@ def main() -> None:
             "rationale": args.rationale,
             "assumptions": tuple(args.assumption),
         }
-        if args.simulation:
+        if args.telemetry:
+            from playtrace.unreal import load_unreal_capture, unreal_evidence
+            try:
+                bundle = unreal_evidence(snapshot, load_unreal_capture(args.telemetry), hypothesis,
+                                         EvidenceRelation(args.relation), args.rationale)
+            except (OSError, ValueError) as error:
+                raise SystemExit(f"Telemetry rejected: {error}") from error
+            if args.assumption:
+                record = bundle.evidence.model_copy(update={"assumptions": (*bundle.evidence.assumptions, *args.assumption)})
+                bundle = ExperimentEvidenceBundle(hypothesis=hypothesis, evidence=record, claim=record.to_claim())
+        elif args.simulation:
             run = _load_model(args.simulation, SimulationRun, "simulation")
             bundle = simulation_evidence(
                 **common, run=run, artifact_path=args.simulation
@@ -1008,8 +1035,15 @@ def main() -> None:
 
     if args.command == "snapshot":
         manifest_path = args.project / "playtrace.toml"
-        gateway = _workspace_gateway(args)
-        snapshot = TabletopProjectAdapter.from_path(manifest_path, gateway).snapshot()
+        if args.local:
+            from playtrace.unreal import UnrealLocalAdapter
+            try:
+                snapshot = UnrealLocalAdapter(args.project).snapshot()
+            except (OSError, ValueError) as error:
+                raise SystemExit(f"Local snapshot rejected: {error}") from error
+        else:
+            gateway = _workspace_gateway(args)
+            snapshot = TabletopProjectAdapter.from_path(manifest_path, gateway).snapshot()
         report = SnapshotAnalyzer().analyze(snapshot)
         with PlayTraceStore(args.db) as store:
             store.save_snapshot(snapshot)
