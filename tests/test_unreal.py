@@ -105,6 +105,32 @@ def test_shield_gain_rejects_unknown_or_incoherent_transitions(project, changes)
         load_unreal_capture(write_capture(project, events))
 
 
+def healing_events(root):
+    events = events_for(root)
+    damage = dict(events[2], event_type="combat.damage", data={"actor_id": "foe.0", "target_id": "scout.0",
+        "damage": 30, "health_before": 100, "health_after": 90, "shield_before": 20, "shield_after": 0})
+    healing = dict(events[2], event_type="combat.healed", data={"entity_id": "scout.0", "health_before": 90,
+        "health_after": 95, "amount": 5})
+    events[3:3] = [damage, healing]
+    for i, event in enumerate(events):
+        event["sequence"] = i
+        event["elapsed_seconds"] = i * .1
+    return events
+
+
+def test_healing_follows_accepted_damage(project):
+    assert load_unreal_capture(write_capture(project, healing_events(project))).events[-1].data["outcome"] == "victory"
+
+
+@pytest.mark.parametrize("changes", [{"entity_id": "unknown"}, {"health_before": 0}, {"health_before": 91},
+    {"health_after": 101, "amount": 11}, {"amount": 4}, {"amount": float("nan")}, {"amount": -5}])
+def test_healing_rejects_incoherent_transitions(project, changes):
+    events = healing_events(project)
+    events[4]["data"].update(changes)
+    with pytest.raises(ValueError):
+        load_unreal_capture(write_capture(project, events))
+
+
 def test_local_snapshot_preserves_status_and_stable_fragments(project):
     before = UnrealLocalAdapter(project).snapshot()
     assert [a.authored_status for a in before.assertions] == [AuthoredStatus.CONFIRMED, AuthoredStatus.WORKING,

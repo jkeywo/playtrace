@@ -261,6 +261,16 @@ def load_unreal_capture(path: Path) -> UnrealCapture:
             shield = _number(data.get("shield"), "shield")
             _require(health > 0, "Combatant must spawn alive")
             actors[entity] = {"health": health, "max_health": health, "shield": shield, "team": data["team"]}
+        elif event.event_type == "combat.healed":
+            target = actors.get(data.get("entity_id"))
+            _require(target is not None, "Healing references unknown combatant")
+            before = _number(data.get("health_before"), "health_before")
+            after = _number(data.get("health_after"), "health_after")
+            amount = _number(data.get("amount"), "amount")
+            _require(before == target["health"] and before > 0, "Healing contradicts living prior state")
+            _require(amount > 0 and before < after <= target["max_health"]
+                     and math.isclose(after, before + amount, abs_tol=1e-4), "Healing arithmetic mismatch")
+            target["health"] = after
         elif event.event_type == "combat.shield_gained":
             target = actors.get(data.get("entity_id"))
             _require(target is not None, "Shield gain references unknown combatant")
