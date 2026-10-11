@@ -32,6 +32,7 @@ def main() -> None:
 
     run(sys.executable, "-m", "pytest", "-p", "no:cacheprovider", f"--basetemp={work / 'tests'}")
     run(node, "--check", "src/playtrace/review/app.js")
+    run(node, "--check", "src/playtrace/report_assets/plugin.js")
     run(sys.executable, "-m", "compileall", "-q", "src", "tests")
     run(uv, "build", "--out-dir", str(work / "dist"))
     run("git", "diff", "--check")
@@ -50,10 +51,12 @@ def main() -> None:
         "from playtrace.cnl import TabletopRuleCompiler; "
         "from playtrace.review_server import REVIEW_ROOT; "
         "from playtrace.demo import build_demo_review; "
+        "from playtrace.simulation_report import _plugin_document; "
         "assert Path(playtrace.__file__).resolve().is_relative_to(Path(os.environ['PLAYTRACE_WHEEL_ROOT'])); "
         "TabletopRuleCompiler(); build_demo_review(); "
         "assert all((REVIEW_ROOT / name).is_file() for name in ('index.html', 'app.js', 'styles.css')); "
-        "print('Installed wheel, grammar, demo and review assets verified.')"
+        "assert 'PlayTraceReplay.mount' in _plugin_document('[]'); "
+        "print('Installed wheel, grammar, demo, review and replay assets verified.')"
     )
     run(sys.executable, "-c", smoke, cwd=work, environment=smoke_env)
     run(sys.executable, "-m", "playtrace", "--help", cwd=work, environment=smoke_env)
