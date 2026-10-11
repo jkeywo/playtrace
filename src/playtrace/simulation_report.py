@@ -17,7 +17,8 @@ def write_simulation_report(runs: Iterable[SimulationRun], output: Path) -> None
         "<", "\\u003c"
     )
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(_document(data), encoding="utf-8")
+    renderer = _plugin_document if any(t["plugin_state"] for t in traces) else _document
+    output.write_text(renderer(data), encoding="utf-8")
 
 
 def write_simulation_fragment(runs: Iterable[SimulationRun], output: Path) -> None:
@@ -28,12 +29,15 @@ def write_simulation_fragment(runs: Iterable[SimulationRun], output: Path) -> No
         "<", "\\u003c"
     )
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(_fragment(data), encoding="utf-8")
+    renderer = _plugin_fragment if any(t["plugin_state"] for t in traces) else _fragment
+    output.write_text(renderer(data), encoding="utf-8")
 
 
 def _report_trace(run: SimulationRun) -> dict[str, Any]:
     return {
         "id": run.id,
+        "plugin_state": any(getattr(c.state, "kind", None) == "plugin" for c in run.state_trace),
+        "plugin_id": run.provenance.plugin_id,
         "label": run.config.id,
         "characters": list(run.config.character_ids),
         "ruleset": run.config.ruleset_id,
@@ -44,6 +48,42 @@ def _report_trace(run: SimulationRun) -> dict[str, Any]:
         "states": [checkpoint.state.model_dump(mode="json") for checkpoint in run.state_trace],
         "blockers": [blocker.model_dump(mode="json") for blocker in run.blockers],
     }
+
+
+def _plugin_document(data: str) -> str:
+    return ('<!doctype html><html lang="en"><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<title>PlayTrace simulation replay</title><body>'
+            + _plugin_fragment(data) + '</body></html>')
+
+
+def _plugin_fragment(data: str) -> str:
+    # Provider strings enter the DOM through textContent only.
+    return '''<main id="pt-plugin-report">
+<style>#pt-plugin-report{font:16px/1.5 system-ui;max-width:1200px;margin:auto;padding:24px}
+#pt-plugin-report pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#eef4f5;color:#142830;padding:16px}
+#pt-plugin-report .panels{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+#pt-plugin-report input{width:65%}@media(max-width:700px){#pt-plugin-report .panels{display:block}}</style>
+<h1>PlayTrace simulation replay</h1><label>Trace <select id="pt-trace"></select></label>
+<p id="pt-summary"></p><button id="pt-prev">Previous</button>
+<input id="pt-position" type="range" min="0" value="0" aria-label="Event position">
+<button id="pt-next">Next</button><p id="pt-counter"></p>
+<div class="panels"><section><h2>Event and source references</h2><pre id="pt-event"></pre>
+<h2>Blockers</h2><pre id="pt-blockers"></pre></section>
+<section><h2>Complete state checkpoint</h2><pre id="pt-state"></pre></section></div>
+<script>(()=>{const traces=DATA;const root=document.getElementById('pt-plugin-report');
+const q=id=>root.querySelector('#pt-'+id);let ti=0,ei=0;
+traces.forEach((t,i)=>{const o=document.createElement('option');o.value=i;o.textContent=t.label;q('trace').append(o)});
+function render(){const t=traces[ti];q('position').max=Math.max(0,t.events.length-1);q('position').value=ei;
+q('summary').textContent=t.plugin_id+' · '+t.status+' · seed '+t.seed+' · '+t.metrics.turns_completed+' turns';
+q('counter').textContent=t.events.length?'Event '+(ei+1)+' / '+t.events.length:'No events';
+q('event').textContent=JSON.stringify(t.events[ei]||{},null,2);
+q('state').textContent=JSON.stringify(t.states[ei]||{},null,2);
+q('blockers').textContent=JSON.stringify(t.blockers,null,2)}
+q('trace').onchange=e=>{ti=Number(e.target.value);ei=0;render()};
+q('position').oninput=e=>{ei=Number(e.target.value);render()};
+q('prev').onclick=()=>{ei=Math.max(0,ei-1);render()};
+q('next').onclick=()=>{ei=Math.min(Math.max(0,traces[ti].events.length-1),ei+1);render()};render()})();</script></main>'''.replace('DATA', data)
 
 
 def _document(data: str) -> str:

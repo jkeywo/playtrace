@@ -120,6 +120,8 @@ _ESCALATION = {"rising": 10.0, "flooding": 38.0, "emergency": 68.0, "catastrophi
 def danger_for_state(state: TabletopSimulationState) -> tuple[float, DangerComponents]:
     """Return 0–100 proximity to catastrophic loss from visible state facts."""
 
+    if not isinstance(state, TabletopSimulationState):
+        raise ValueError("The bundled tension metric requires tabletop simulation state")
     escalation = _ESCALATION.get(state.escalation.lower(), 0.0)
     ratios = []
     for card_id, cubes in state.tableau.items():

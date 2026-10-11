@@ -12,7 +12,7 @@ import tempfile
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field, JsonValue, field_validator, model_validator
 from pydantic_core import PydanticCustomError
@@ -73,6 +73,7 @@ class PlayerPolicyKind(StrEnum):
     RISK_AVERSE = "risk_averse"
     RANDOM_CONSTRAINED = "random_constrained"
     SCRIPTED = "scripted"
+    PLUGIN_SCRIPTED = "plugin_scripted"
 
 
 class PlayerActionKind(StrEnum):
@@ -163,11 +164,19 @@ class SimulationConfig(StrictModel):
     overrides: tuple[SimulationOverride, ...] = ()
     scripted_steps: tuple[ScriptedPolicyStep, ...] = ()
     strict_semantics: bool = False
+    plugin_config: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @field_validator("plugin_config", mode="before")
+    @classmethod
+    def validate_plugin_config(cls, value: Any) -> JsonValue:
+        return SimulationOverride.validate_json_value(value)
 
     @model_validator(mode="after")
     def require_valid_limits_and_unique_overrides(self) -> "SimulationConfig":
         if self.max_turns < 1:
             raise ValueError("max_turns must be positive")
+        if self.player_policy is PlayerPolicyKind.PLUGIN_SCRIPTED and not self.plugin_config:
+            raise ValueError("plugin_scripted policy requires plugin_config")
         keys = [item.key for item in self.overrides]
         if len(keys) != len(set(keys)):
             raise ValueError("simulation override keys must be unique")
@@ -207,7 +216,22 @@ class SimulationEvent(StrictModel):
 
 class SimulationCheckpoint(StrictModel):
     sequence: int
-    state: "TabletopSimulationState"
+    state: "TabletopSimulationState | PluginSimulationState"
+
+
+class PluginSimulationState(StrictModel):
+    """Game-owned state without imposing the bundled tabletop game's model."""
+
+    kind: Literal["plugin"] = "plugin"
+    plugin_id: str = Field(min_length=1)
+    turn: int = Field(default=0, ge=0)
+    status: SimulationStatus = SimulationStatus.READY
+    data: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @field_validator("data", mode="before")
+    @classmethod
+    def validate_state_data(cls, value: Any) -> JsonValue:
+        return SimulationOverride.validate_json_value(value)
 
 
 class TabletopSimulationState(StrictModel):
@@ -275,8 +299,8 @@ class SimulationRun(StrictModel):
     id: str
     config: SimulationConfig
     provenance: SimulationProvenance
-    initial_state: TabletopSimulationState | None = None
-    final_state: TabletopSimulationState | None = None
+    initial_state: TabletopSimulationState | PluginSimulationState | None = None
+    final_state: TabletopSimulationState | PluginSimulationState | None = None
     events: tuple[SimulationEvent, ...] = ()
     state_trace: tuple[SimulationCheckpoint, ...] = ()
     blockers: tuple[SimulationBlocker, ...] = ()
