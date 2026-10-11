@@ -13,6 +13,11 @@ while a game is being discovered, not only after it has become a specification.
 
 ## Current milestone
 
+Native [Google Drive and Sheets support](docs/google-sheets.md) now includes
+explicit single-editor application of approved literal-cell patches, verified
+readback and journaled recovery. Table row provenance and cache range expansion
+are checked. Formula cells remain read-only to this patch path.
+
 A first [local Unreal source and telemetry pilot](docs/unreal.md) supports
 `snapshot --local`, `validate-telemetry` and hypothesis-linked
 `record-experiment --telemetry`. Dread Meridian supplies the game-owned combat
@@ -89,6 +94,9 @@ uv run pytest
 uv run playtrace demo
 uv run playtrace review
 ```
+
+Run the complete M6 release gate with `uv run python scripts/check_release.py`.
+It also verifies the built wheel and runs in CI on Windows and Linux.
 
 To replay the Crisis Wardens M1 capture:
 

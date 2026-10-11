@@ -7,7 +7,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field, model_validator
 
@@ -18,6 +18,7 @@ from playtrace.docs_adapter import (
     utf16_code_unit_length,
 )
 from playtrace.models import StrictModel
+from playtrace.sheet_ranges import literal_matrix, parse_sheet_range, same_cells
 from playtrace.workspace import WorkspaceConcurrencyError, WorkspaceGateway
 
 
@@ -132,6 +133,7 @@ class SagaOperation(StrictModel):
     compensated: bool = False
     response: dict[str, Any] | None = None
     error: str | None = None
+    sheet_write_mode: Literal["atomic", "single-editor"] = "atomic"
 
 
 class WriteSaga(StrictModel):
@@ -508,10 +510,11 @@ class SemanticPatchExecutor:
                 raise PatchConflictError(
                     f"{patch.source_id} version changed: expected {patch.required_version}, got {current_version}"
                 )
-            payload = self.gateway.get_spreadsheet(patch.file_id, (patch.range,))
-            actual = tuple(tuple(row) for row in payload["ranges"].get(patch.range, []))
-            if actual != patch.expected_values:
+            actual = self._sheet_values(patch)
+            if not self._sheet_matches(patch, actual, patch.expected_values):
                 raise PatchConflictError(f"{patch.source_id} values changed in {patch.range}")
+            if hasattr(self.gateway, "get_sheet_patch_values"):
+                literal_matrix(patch.replacement_values, parse_sheet_range(patch.range, require_sheet=True))
 
         checked = len(patch_set.document_patches) + len(patch_set.sheet_patches)
         if dry_run:
@@ -523,6 +526,8 @@ class SemanticPatchExecutor:
             )
 
         responses: list[dict[str, Any]] = []
+        if getattr(self.gateway, "supports_canonical_writes", False):
+            raise ValueError("live writes require execute_transactional and a durable saga journal")
         for patches in document_groups:
             patch = patches[0]
             responses.append(
@@ -558,6 +563,26 @@ class SemanticPatchExecutor:
 
         if self.saga_journal is None:
             raise ValueError("transactional canonical writes require a durable saga journal")
+        # Check the selected provider mode and all ranges before any document
+        # writes. A blocked Sheet must not trigger avoidable compensation.
+        sheet_targets: list[tuple[str, Any]] = []
+        for patch in patch_set.sheet_patches:
+            check = getattr(self.gateway, "preflight_sheet_write", None)
+            if check is not None:
+                try:
+                    check(patch.file_id, [patch.google_data()])
+                except WorkspaceConcurrencyError as error:
+                    raise PatchConflictError(str(error)) from error
+            target = parse_sheet_range(patch.range)
+            for file_id, other in sheet_targets:
+                if file_id == patch.file_id and (
+                    target.sheet == other.sheet or target.sheet is None or other.sheet is None
+                ) and not (
+                    target.end_row < other.row or other.end_row < target.row
+                    or target.end_column < other.column or other.end_column < target.column
+                ):
+                    raise PatchConflictError("sheet patch ranges overlap")
+            sheet_targets.append((patch.file_id, target))
         # Re-run all revision/value guards immediately before capturing before-images.
         preflight = self.execute(patch_set, dry_run=True)
         operations: list[SagaOperation] = []
@@ -637,6 +662,7 @@ class SemanticPatchExecutor:
                     file_id=patch.file_id,
                     patch=patch.model_dump(mode="json"),
                     before_image={"values": patch.expected_values},
+                    sheet_write_mode=getattr(self.gateway, "sheet_write_mode", "atomic"),
                 )
             )
         saga = WriteSaga(
@@ -839,9 +865,8 @@ class SemanticPatchExecutor:
                 raise RuntimeError(f"document verification mismatch for {patch.source_id}")
         else:
             patch = SheetValuesPatch.model_validate(operation.patch)
-            payload = self.gateway.get_spreadsheet(patch.file_id, (patch.range,))
-            actual = tuple(tuple(row) for row in payload["ranges"].get(patch.range, []))
-            if actual != patch.replacement_values:
+            actual = self._sheet_values(patch)
+            if not self._sheet_matches(patch, actual, patch.replacement_values):
                 raise RuntimeError(f"sheet verification mismatch for {patch.source_id}")
         return operation.model_copy(update={"verified": True})
 
@@ -1099,12 +1124,13 @@ class SemanticPatchExecutor:
                 raise PatchConflictError("document changed after saga failure; refusing compensation")
         else:
             patch = SheetValuesPatch.model_validate(operation.patch)
-            payload = self.gateway.get_spreadsheet(patch.file_id, (patch.range,))
-            actual = tuple(tuple(row) for row in payload["ranges"].get(patch.range, []))
-            if actual == patch.expected_values:
+            actual = self._sheet_values(patch)
+            if self._sheet_matches(patch, actual, patch.expected_values):
                 return operation.model_copy(update={"compensated": True})
-            if actual != patch.replacement_values:
+            if not self._sheet_matches(patch, actual, patch.replacement_values):
                 raise PatchConflictError("sheet changed after saga failure; refusing compensation")
+            if operation.sheet_write_mode != getattr(self.gateway, "sheet_write_mode", "atomic"):
+                raise PatchConflictError("recovery requires the sheet write mode recorded in the saga")
             compensation_guard = patch.model_copy(
                 update={
                     "expected_values": patch.replacement_values,
@@ -1112,16 +1138,15 @@ class SemanticPatchExecutor:
                 }
             )
             self._compare_and_update_sheet_values(patch.file_id, [compensation_guard])
-            restored = self.gateway.get_spreadsheet(patch.file_id, (patch.range,))
-            actual = tuple(tuple(row) for row in restored["ranges"].get(patch.range, []))
-            if actual != patch.expected_values:
+            actual = self._sheet_values(patch)
+            if not self._sheet_matches(patch, actual, patch.expected_values):
                 raise RuntimeError("sheet compensation verification failed")
         return operation.model_copy(update={"compensated": True})
 
     def _compare_and_update_sheet_values(
         self, file_id: str, patches: list[SheetValuesPatch]
     ) -> dict[str, Any]:
-        """Use one provider-side comparison and write, or refuse the mutation."""
+        """Use atomic comparison unless explicitly operating as a single editor."""
 
         expected_data = [
             {
@@ -1132,6 +1157,13 @@ class SemanticPatchExecutor:
             for patch in patches
         ]
         try:
+            if getattr(self.gateway, "sheet_write_mode", "atomic") == "single-editor":
+                writer = getattr(self.gateway, "observed_batch_update_sheet_values", None)
+                if writer is None:
+                    raise WorkspaceConcurrencyError("provider does not support single-editor sheet writes")
+                return writer(
+                    file_id, [patch.google_data() for patch in patches], expected_data
+                )
             return self.gateway.compare_and_batch_update_sheet_values(
                 file_id,
                 [patch.google_data() for patch in patches],
@@ -1139,6 +1171,18 @@ class SemanticPatchExecutor:
             )
         except WorkspaceConcurrencyError as error:
             raise PatchConflictError(str(error)) from error
+
+    def _sheet_values(self, patch: SheetValuesPatch) -> tuple:
+        reader = getattr(self.gateway, "get_sheet_patch_values", None)
+        if reader is not None:
+            return reader(patch.file_id, patch.range)
+        payload = self.gateway.get_spreadsheet(patch.file_id, (patch.range,))
+        return tuple(tuple(row) for row in payload["ranges"][patch.range])
+
+    def _sheet_matches(self, patch: SheetValuesPatch, actual: tuple, expected: tuple) -> bool:
+        if hasattr(self.gateway, "get_sheet_patch_values"):
+            expected = literal_matrix(expected, parse_sheet_range(patch.range, require_sheet=True))
+        return same_cells(actual, expected)
 
     @staticmethod
     def _text_digest(text: str) -> str:

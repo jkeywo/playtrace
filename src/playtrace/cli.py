@@ -123,6 +123,8 @@ def build_parser() -> argparse.ArgumentParser:
     recover.add_argument("--access-token-env", metavar="ENV_VAR", required=True)
     recover.set_defaults(fixture=None)
     recover.add_argument("--output", type=Path)
+    recover.add_argument("--sheet-write-mode", choices=("atomic", "single-editor"), default="atomic",
+                         help="single-editor permits observed Sheets writes while other editors are paused")
 
     container = subparsers.add_parser(
         "container-doctor", help="verify the pinned isolated simulation container contract"
@@ -309,6 +311,8 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("project", type=Path)
     apply.add_argument("--access-token-env", metavar="ENV_VAR", required=True)
     apply.set_defaults(fixture=None)
+    apply.add_argument("--sheet-write-mode", choices=("atomic", "single-editor"), default="atomic",
+                       help="single-editor permits observed Sheets writes while other editors are paused")
     _proposal_action_arguments(apply)
 
     promote = subparsers.add_parser(
@@ -1084,7 +1088,9 @@ def _workspace_gateway(args: argparse.Namespace) -> WorkspaceGateway:
         raise SystemExit(
             f"environment variable {args.access_token_env!r} is empty or unset"
         )
-    return GoogleWorkspaceGateway(access_token)
+    return GoogleWorkspaceGateway(
+        access_token, sheet_write_mode=getattr(args, "sheet_write_mode", "atomic")
+    )
 
 
 def _proposal_transition_arguments(parser: argparse.ArgumentParser) -> None:

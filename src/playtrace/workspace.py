@@ -8,6 +8,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Protocol
 
+from playtrace.sheet_ranges import literal_matrix, parse_sheet_range, same_cells
+
 
 class WorkspaceConcurrencyError(RuntimeError):
     """A workspace provider cannot safely satisfy a compare-and-write request."""
@@ -58,11 +60,63 @@ class GoogleWorkspaceGateway:
 
     supports_canonical_writes = True
 
-    def __init__(self, access_token: str, timeout: float = 60) -> None:
+    def __init__(
+        self, access_token: str, timeout: float = 60, *,
+        sheet_write_mode: str = "atomic",
+    ) -> None:
         if not access_token:
             raise ValueError("an OAuth access token is required")
         self.access_token = access_token
         self.timeout = timeout
+        if sheet_write_mode not in {"atomic", "single-editor"}:
+            raise ValueError("unknown sheet write mode")
+        self.sheet_write_mode = sheet_write_mode
+
+    def get_sheet_patch_values(self, file_id: str, range_name: str) -> tuple:
+        target = parse_sheet_range(range_name, require_sheet=True)
+        payload = self._request(
+            "GET",
+            f"https://sheets.googleapis.com/v4/spreadsheets/{urllib.parse.quote(file_id, safe='')}/values:batchGet",
+            query=[("ranges", range_name), ("majorDimension", "ROWS"),
+                   ("valueRenderOption", "FORMULA"), ("dateTimeRenderOption", "SERIAL_NUMBER")],
+        )
+        ranges = payload.get("valueRanges", [])
+        if len(ranges) != 1:
+            raise ValueError("Google Sheets omitted the requested patch range")
+        return literal_matrix(ranges[0].get("values", []), target)
+
+    def preflight_sheet_write(self, file_id: str, data: list[dict[str, Any]]) -> None:
+        if self.sheet_write_mode != "single-editor":
+            raise WorkspaceConcurrencyError(
+                "Google Sheets has no atomic compare-and-write guard; "
+                "use --sheet-write-mode single-editor only while other editors are paused"
+            )
+        for item in data:
+            target = parse_sheet_range(item["range"], require_sheet=True)
+            literal_matrix(item["values"], target)
+
+    def observed_batch_update_sheet_values(
+        self, file_id: str, data: list[dict[str, Any]],
+        expected_data: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Explicit single-editor read/check/write; this is NOT atomic CAS."""
+        self.preflight_sheet_write(file_id, data)
+        if [item["range"] for item in data] != [item["range"] for item in expected_data]:
+            raise ValueError("every sheet write needs a matching expected range")
+        normalized = []
+        for item, expected in zip(data, expected_data, strict=True):
+            target = parse_sheet_range(item["range"], require_sheet=True)
+            wanted = literal_matrix(expected["values"], target)
+            actual = self.get_sheet_patch_values(file_id, item["range"])
+            if not same_cells(actual, wanted):
+                raise WorkspaceConcurrencyError(f"sheet values changed before write in {item['range']}")
+            normalized.append({"range": item["range"], "majorDimension": "ROWS",
+                               "values": literal_matrix(item["values"], target)})
+        response = self.batch_update_sheet_values(file_id, normalized)
+        for item in normalized:
+            if not same_cells(self.get_sheet_patch_values(file_id, item["range"]), item["values"]):
+                raise WorkspaceConcurrencyError(f"sheet verification mismatch in {item['range']}")
+        return {"provider_response": response, "sheet_write_mode": "single-editor"}
 
     def get_file(self, file_id: str) -> dict[str, Any]:
         fields = "id,name,mimeType,modifiedTime,version,parents,webViewLink,appProperties"

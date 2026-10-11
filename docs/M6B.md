@@ -12,13 +12,15 @@ observes canon and compares it with the exact before/after images. Compensation
 runs in reverse order and verifies every restoration. Ambiguous or externally
 changed canon remains `recovery_failed`; it is never guessed back into shape.
 
-Sheets mutations require a provider-side atomic compare-and-write over every
-target range. The fixture transport implements that contract for deterministic
-testing. Google Sheets v4 exposes no value or Drive-version precondition on its
-values update endpoint, so the live Google transport fails closed before issuing
-a write. A read immediately before a write is not accepted as concurrency
-control because it still leaves an observation/write race. Compensation uses
-the same guard and therefore cannot overwrite an edit made after application.
+By default, Sheets mutations require a provider-side atomic compare-and-write
+over every target range. The fixture transport implements that contract for
+deterministic testing. Google Sheets v4 exposes no value or Drive-version
+precondition on its values update endpoint, so the default live transport fails
+closed before issuing a write. The explicit `--sheet-write-mode single-editor`
+option enables observed, verified literal-cell writes and records that weaker
+guarantee in the durable journal. Other editors must be paused: neither the
+forward write nor compensation can eliminate the observation/write race.
+Observed conflicting edits still stop recovery. See [Google Sheets support](google-sheets.md).
 
 Google Docs coordinates are interpreted strictly as UTF-16 code units. Patch
 ranges must identify an existing tab, land on valid code-unit boundaries, match

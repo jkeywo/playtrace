@@ -378,8 +378,11 @@ def test_terminal_adoption_treats_compensation_as_attempt_evidence(
 def test_sheet_forward_compare_and_write_rejects_observation_race() -> None:
     gateway = RacingCompareGateway(_sheet_payload(), race_on_compare=1)
 
-    with pytest.raises(PatchConflictError, match="changed before compare-and-write"):
-        SemanticPatchExecutor(gateway).execute(_sheet_patch(), dry_run=False)
+    with _journal_connection() as connection:
+        with pytest.raises(SagaExecutionError, match="changed before compare-and-write"):
+            SemanticPatchExecutor(gateway, saga_journal=WriteSagaJournal(connection)).execute_transactional(
+                _sheet_patch(), proposal_id="proposal", attempt_id="attempt"
+            )
 
     assert gateway.payload["spreadsheets"]["sheet"]["ranges"]["A1"] == [
         ["third-party"]
@@ -424,7 +427,10 @@ def test_google_sheets_transport_fails_closed_without_issuing_request(
     )
 
     with pytest.raises(PatchConflictError, match="atomic compare-and-write"):
-        SemanticPatchExecutor(gateway).execute(_sheet_patch(), dry_run=False)
+        with _journal_connection() as connection:
+            SemanticPatchExecutor(gateway, saga_journal=WriteSagaJournal(connection)).execute_transactional(
+                _sheet_patch(), proposal_id="proposal", attempt_id="attempt"
+            )
 
     assert requests == []
 

@@ -41,20 +41,20 @@ class TabletopProjectAdapter:
         revisions: list[SourceRevision] = []
         entities: list[DesignEntity] = []
         assertions: list[Assertion] = []
+        sheet_omissions: list[str] = []
 
         manifest_revision = self._validate_drive_manifest()
         if manifest_revision is not None:
             revisions.append(manifest_revision)
 
         for source in self.manifest.sources:
-            metadata = self.gateway.get_file(source.file_id)
+            metadata, payload = self._stable_read(
+                source.file_id, source.kind,
+                tuple(table.range for table in source.tables),
+            )
             if source.kind is WorkspaceSourceKind.GOOGLE_DOC:
-                payload = self.gateway.get_document(source.file_id)
                 provider_revision = str(payload.get("revisionId") or metadata.get("version") or metadata["modifiedTime"])
             else:
-                payload = self.gateway.get_spreadsheet(
-                    source.file_id, tuple(table.range for table in source.tables)
-                )
                 provider_revision = str(metadata.get("version") or metadata["modifiedTime"])
             revision = self._source_revision(source.id, source.file_id, metadata, provider_revision, payload)
             revisions.append(revision)
@@ -76,6 +76,7 @@ class TabletopProjectAdapter:
                     revision.id,
                     self.adapter_id,
                 )
+                sheet_omissions.extend(records.omissions)
                 entities.extend(records.entities)
                 assertions.extend(records.assertions)
 
@@ -97,6 +98,7 @@ class TabletopProjectAdapter:
             omissions=(
                 "Only explicitly status-marked Doc passages become assertions.",
                 "Unmarked prose remains traceable as entities but is not compiled as mechanics.",
+                *sheet_omissions,
             ),
         )
 
@@ -105,9 +107,8 @@ class TabletopProjectAdapter:
         file_id = self.manifest.drive_manifest_file_id
         if file_id is None:
             return None
-        metadata = self.gateway.get_file(file_id)
-        payload = self.gateway.get_spreadsheet(
-            file_id, (self.manifest.drive_manifest_range,)
+        metadata, payload = self._stable_read(
+            file_id, WorkspaceSourceKind.GOOGLE_SHEET, (self.manifest.drive_manifest_range,)
         )
         values = payload["ranges"][self.manifest.drive_manifest_range]
         if not values:
@@ -152,6 +153,21 @@ class TabletopProjectAdapter:
             provider_revision,
             payload,
         )
+
+    def _stable_read(self, file_id: str, kind: WorkspaceSourceKind, ranges: tuple[str, ...]) -> tuple[dict, dict]:
+        for _ in range(3):
+            before = self.gateway.get_file(file_id)
+            revision = str(before.get("version") or before.get("modifiedTime") or "")
+            if not revision:
+                raise ValueError(f"{file_id} has no provider revision metadata")
+            payload = (
+                self.gateway.get_document(file_id) if kind is WorkspaceSourceKind.GOOGLE_DOC
+                else self.gateway.get_spreadsheet(file_id, ranges)
+            )
+            after = self.gateway.get_file(file_id)
+            if str(after.get("version") or after.get("modifiedTime") or "") == revision:
+                return after, payload
+        raise ValueError(f"{file_id} changed revision during three snapshot fetch attempts")
 
     def _append_compiled_rules(
         self,

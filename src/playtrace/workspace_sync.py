@@ -149,6 +149,11 @@ class WorkspaceSynchronizer:
                 self._validate_metadata(metadata_before, expected_app_properties)
                 revision = self._revision(source.id, metadata_before)
                 payload = self.cache.get(manifest.project_id, source.file_id, revision)
+                # The cache is keyed by file revision, but a local manifest can
+                # expand its range selection without changing the Google file.
+                if payload is not None and source.kind is WorkspaceSourceKind.GOOGLE_SHEET:
+                    if not all(table.range in payload.get("ranges", {}) for table in source.tables):
+                        payload = None
                 hit = payload is not None
                 if payload is None:
                     if source.kind is WorkspaceSourceKind.GOOGLE_DOC:
