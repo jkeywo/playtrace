@@ -10,6 +10,7 @@ test('card gallery includes indirect effects, removed cards and hands without du
   after.data.locations.x.discard=['b']; after.data.players.p.hand=['c'];
   assert.deepEqual(new Set(ui.involvedCards({entity_ids:['one','one']},before,after)),new Set(['one','two','three']));
   assert.deepEqual(ui.involvedCards({entity_ids:[]},before,before),[]);
+  assert.deepEqual(ui.involvedCards({entity_ids:[]},state({players:{p:{hand:'custom schema'}}}),state({players:{p:{hand:{a:1}}}})),[]);
 });
 test('image views only accept embedded raster images', () => {
   assert.ok(ui.safeImage('data:image/webp;base64,YWJj'));

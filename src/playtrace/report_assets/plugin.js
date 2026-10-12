@@ -78,7 +78,7 @@ var PlayTraceReplay = (() => {
           if(!equal(a.cards?.[card],b.cards?.[card])) add(card);
         }
         for (const pile of ['hand','discard','set_aside','recipes']) {
-          const aa = a[pile] || [], bb = b[pile] || [];
+          const aa = Array.isArray(a[pile]) ? a[pile] : [], bb = Array.isArray(b[pile]) ? b[pile] : [];
           for(const card of new Set([...aa,...bb])) if(aa.filter(c=>c===card).length !== bb.filter(c=>c===card).length) add(card);
         }
       }
@@ -120,9 +120,9 @@ var PlayTraceReplay = (() => {
     }
     q('card-close').onclick=()=>q('card-dialog').close();
     function renderCards(t,event,previous,state,lookup) {
+      if(!t.card_images) {q('cards').replaceChildren();q('card-panel').hidden=true;return;}
       const ids = involvedCards(event,previous,state);
-      q('cards').replaceChildren(); q('card-panel').hidden=!ids.length || !t.card_images;
-      if(!t.card_images) return;
+      q('cards').replaceChildren(); q('card-panel').hidden=!ids.length;
       for(const id of ids) {
         const card=t.card_images[id], figure=el('figure');
         if(!card || !['front','back'].some(face=>safeImage(card[face]))) {
