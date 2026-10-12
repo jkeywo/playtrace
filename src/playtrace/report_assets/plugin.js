@@ -65,6 +65,27 @@ var PlayTraceReplay = (() => {
   function description(event) {
     return event?.data?.description || (event ? `${pretty(event.event_type)}.` : 'No actions recorded.');
   }
+  function involvedCards(event, before, after) {
+    const data = s => s?.kind === 'plugin' ? s.data || {} : s || {};
+    const old = data(before), current = data(after);
+    const definitions = {...old.card_names, ...current.card_names};
+    const ids = new Set(event?.entity_ids || []);
+    const add = key => {if(definitions[key]?.id) ids.add(definitions[key].id);};
+    for (const group of ['players','locations']) {
+      for (const key of new Set([...Object.keys(old[group] || {}), ...Object.keys(current[group] || {})])) {
+        const a = old[group]?.[key] || {}, b = current[group]?.[key] || {};
+        for (const card of new Set([...Object.keys(a.cards || {}), ...Object.keys(b.cards || {})])) {
+          if(!equal(a.cards?.[card],b.cards?.[card])) add(card);
+        }
+        for (const pile of ['hand','discard','set_aside','recipes']) {
+          const aa = a[pile] || [], bb = b[pile] || [];
+          for(const card of new Set([...aa,...bb])) if(aa.filter(c=>c===card).length !== bb.filter(c=>c===card).length) add(card);
+        }
+      }
+    }
+    return [...ids];
+  }
+  const safeImage = url => typeof url === 'string' && /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(url);
   function changeText(change, lookup) {
     if (Array.isArray(change.before) && Array.isArray(change.after)) {
       const remainder = [...change.before];
@@ -83,6 +104,38 @@ var PlayTraceReplay = (() => {
     const el = (tag, text, className) => {const n = document.createElement(tag); if (text !== undefined) n.textContent = text; if (className) n.className = className; return n;};
     let ti = 0, ei = 0, selected = 'overview', logTrace = -1, logPosition = -1;
     const button = (text, action, cls) => {const b = el('button', text, cls); b.type = 'button'; b.onclick = action; return b;};
+    function faces(parent, card, select, selectedFace) {
+      parent.replaceChildren(); parent.className = 'card-face-controls';
+      for (const face of ['front','back']) if(safeImage(card[face])) {
+        const b=button(pretty(face),()=>{select(face); [...parent.children].forEach(n=>n.setAttribute('aria-pressed',String(n===b)));});
+        b.setAttribute('aria-pressed',String(face === (selectedFace || (safeImage(card.front) ? 'front':'back')))); parent.append(b);
+      }
+    }
+    function showCard(card, selectedFace) {
+      q('card-title').textContent=card.name;
+      q('card-note').textContent=card.note || '';
+      const select=face=>{q('card-large').src=card[face];q('card-large').alt=`${card.name} — ${face}`;
+        q('card-download').href=card[face];q('card-download').download=`${card.name.replace(/[^a-z0-9-]/gi,'_')}-${face}.${card[face].startsWith('data:image/png')?'png':card[face].startsWith('data:image/webp')?'webp':'jpg'}`;};
+      faces(q('card-faces'),card,select,selectedFace);select(selectedFace || (safeImage(card.front)?'front':'back')); q('card-dialog').showModal();
+    }
+    q('card-close').onclick=()=>q('card-dialog').close();
+    function renderCards(t,event,previous,state,lookup) {
+      const ids = involvedCards(event,previous,state);
+      q('cards').replaceChildren(); q('card-panel').hidden=!ids.length || !t.card_images;
+      if(!t.card_images) return;
+      for(const id of ids) {
+        const card=t.card_images[id], figure=el('figure');
+        if(!card || !['front','back'].some(face=>safeImage(card[face]))) {
+          figure.append(el('figcaption',lookup.get(id)||id),el('p','Image unavailable','muted'));q('cards').append(figure);continue;
+        }
+        const img=el('img'); img.loading='lazy';
+        let selectedFace=safeImage(card.front)?'front':'back';
+        const picture=button('',()=>showCard(card,selectedFace),'card-picture');picture.setAttribute('aria-label',`Enlarge ${card.name}`);picture.append(img);
+        const controls=el('div'); const select=face=>{selectedFace=face;img.src=card[face];img.alt=`${card.name} — ${face}`;};
+        faces(controls,card,select);select(safeImage(card.front)?'front':'back');
+        figure.append(picture,el('figcaption',card.name),controls);q('cards').append(figure);
+      }
+    }
     traces.forEach((t, i) => {const o = el('option', t.label); o.value = i; q('trace').append(o);});
     function selectTab(id) {selected = id; render(); q('tabs').querySelector('[aria-selected=true]')?.focus();}
     function renderFields(parent, value, previous, lookup, path = []) {
@@ -137,6 +190,7 @@ var PlayTraceReplay = (() => {
       q('counter').textContent = t.events.length ? `Action ${ei+1} of ${t.events.length}` : 'No actions';
       q('phase').textContent = `Turn ${event?.turn ?? state?.turn ?? 0} / ${data.phase || 'Replay'}`;
       q('description').textContent = description(event);
+      renderCards(t,event,previous,state,lookup);
       q('affected').replaceChildren(el('span', state ? 'Changed here:' : 'State checkpoint unavailable.'));
       const affected = all.filter(tab => tab.changes.length);
       if (!affected.length && state) q('affected').append(el('span', ei === 0 ? 'Initial state.' : previous ? 'No state changes in this action.' : 'Previous checkpoint unavailable; changes cannot be compared.', 'muted'));
@@ -184,6 +238,6 @@ var PlayTraceReplay = (() => {
     q('next').onclick=()=>{ei=Math.min(Math.max(0,traces[ti].events.length-1),ei+1);render();};
     render();
   }
-  return {mount, equal, diff, tabs, changesFor, names, display, description, changeText};
+  return {mount, equal, diff, tabs, changesFor, names, display, description, changeText, involvedCards, safeImage};
 })();
 if (typeof module !== 'undefined') module.exports = PlayTraceReplay;

@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
 from pathlib import Path
 from typing import Any, Iterable
 
 from playtrace.simulation import SimulationRun
 
 
-def write_simulation_report(runs: Iterable[SimulationRun], output: Path) -> None:
+def write_simulation_report(runs: Iterable[SimulationRun], output: Path, *, card_images: Path | None = None) -> None:
     traces = [_report_trace(run) for run in runs]
     if not traces:
         raise ValueError("at least one simulation run is required")
+    _attach_card_images(traces, card_images)
     data = json.dumps(traces, separators=(",", ":"), ensure_ascii=True).replace(
         "<", "\\u003c"
     )
@@ -21,10 +24,11 @@ def write_simulation_report(runs: Iterable[SimulationRun], output: Path) -> None
     output.write_text(renderer(data), encoding="utf-8")
 
 
-def write_simulation_fragment(runs: Iterable[SimulationRun], output: Path) -> None:
+def write_simulation_fragment(runs: Iterable[SimulationRun], output: Path, *, card_images: Path | None = None) -> None:
     traces = [_report_trace(run) for run in runs]
     if not traces:
         raise ValueError("at least one simulation run is required")
+    _attach_card_images(traces, card_images)
     data = json.dumps(traces, separators=(",", ":"), ensure_ascii=True).replace(
         "<", "\\u003c"
     )
@@ -38,6 +42,7 @@ def _report_trace(run: SimulationRun) -> dict[str, Any]:
         "id": run.id,
         "plugin_state": any(getattr(c.state, "kind", None) == "plugin" for c in run.state_trace),
         "plugin_id": run.provenance.plugin_id,
+        "snapshot_digest": run.provenance.snapshot_digest,
         "label": run.config.id,
         "characters": list(run.config.character_ids),
         "ruleset": run.config.ruleset_id,
@@ -53,6 +58,46 @@ def _report_trace(run: SimulationRun) -> dict[str, Any]:
         "initial_state": run.initial_state.model_dump(mode="json") if run.initial_state else None,
         "blockers": [blocker.model_dump(mode="json") for blocker in run.blockers],
     }
+
+
+def _attach_card_images(traces: list[dict[str, Any]], manifest_path: Path | None) -> None:
+    """Embed verified raster faces outside game state, retaining portable reports."""
+    if manifest_path is None:
+        return
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if any(t["snapshot_digest"] != manifest.get("snapshot_digest") for t in traces):
+        raise ValueError("Card images belong to a different source snapshot; rebuild the image manifest")
+    root = manifest_path.resolve().parent
+    catalog = {}
+    total = 0
+    for entity_id, card in manifest["cards"].items():
+        faces = {}
+        for face in ("front", "back"):
+            entry = card.get(face)
+            if not entry:
+                continue
+            path = (root / entry["path"]).resolve()
+            if not path.is_relative_to(root):
+                raise ValueError("Card image path escapes the manifest directory")
+            size = path.stat().st_size
+            total += size
+            if size > 5_000_000 or total > 50_000_000:
+                raise ValueError("Card image manifest exceeds the embedded image size limit")
+            raw = path.read_bytes()
+            if hashlib.sha256(raw).hexdigest() != entry["sha256"]:
+                raise ValueError(f"Card image fingerprint changed: {entity_id} {face}")
+            if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+                mime = "image/png"
+            elif raw.startswith(b"\xff\xd8\xff"):
+                mime = "image/jpeg"
+            elif raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+                mime = "image/webp"
+            else:
+                raise ValueError("Card faces must be PNG, JPEG or WebP images")
+            faces[face] = "data:" + mime + ";base64," + base64.b64encode(raw).decode("ascii")
+        catalog[entity_id] = {"name": card["name"], "note": card.get("note", ""), **faces}
+    for trace in traces:
+        trace["card_images"] = catalog
 
 
 def _plugin_document(data: str) -> str:

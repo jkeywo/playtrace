@@ -215,6 +215,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report.add_argument("--run", type=Path, action="append", required=True)
     report.add_argument("--output", type=Path, required=True)
+    report.add_argument("--card-images", type=Path, help="snapshot-bound manifest of rendered card faces to embed")
 
     batch = subparsers.add_parser(
         "simulate-batch", help="measure tension for all Crisis Wardens character combinations"
@@ -872,7 +873,7 @@ def main() -> None:
         for path in args.run:
             payload = json.loads(path.read_text(encoding="utf-8"))
             runs.append(SimulationRun.model_validate(payload.get("simulation", payload)))
-        write_simulation_report(runs, args.output)
+        write_simulation_report(runs, args.output, card_images=args.card_images)
         print(args.output.resolve())
         return
 

@@ -3,6 +3,18 @@ const assert = require('node:assert/strict');
 const source = require('node:fs').readFileSync(require('node:path').join(__dirname, '../src/playtrace/report_assets/plugin.js'), 'utf8');
 const ui = require('node:vm').runInThisContext(source + ';PlayTraceReplay');
 const state = (data, turn = 1) => ({kind:'plugin',turn,status:'running',data});
+test('card gallery includes indirect effects, removed cards and hands without duplicates', () => {
+  const before=state({card_names:{a:{id:'one'},b:{id:'two'},c:{id:'three'}},locations:{x:{cards:{a:{value:2},b:{value:1}},discard:[]}},players:{p:{hand:[]}}});
+  const after=structuredClone(before);
+  after.data.locations.x.cards.a.value=4; delete after.data.locations.x.cards.b;
+  after.data.locations.x.discard=['b']; after.data.players.p.hand=['c'];
+  assert.deepEqual(new Set(ui.involvedCards({entity_ids:['one','one']},before,after)),new Set(['one','two','three']));
+  assert.deepEqual(ui.involvedCards({entity_ids:[]},before,before),[]);
+});
+test('image views only accept embedded raster images', () => {
+  assert.ok(ui.safeImage('data:image/webp;base64,YWJj'));
+  for(const url of ['javascript:alert(1)','https://example.org/image.png','data:image/svg+xml;base64,YWJj','data:image/png;base64,<img>']) assert.equal(ui.safeImage(url),false);
+});
 test('movement highlights both locations and the player, including zero-capability players', () => {
   const data = {players:{p:{name:'Explorer', at:'a',hand:[]}},locations:{a:{name:'Hill'},b:{name:'Lake'}}};
   const before = state(data), after = structuredClone(before); after.data.players.p.at = 'b';
