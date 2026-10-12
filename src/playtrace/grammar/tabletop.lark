@@ -1,0 +1,36 @@
+start: rule+
+
+rule: "RULE" RULE_ID ":" statement "."
+
+?statement: trigger
+          | condition
+          | permission
+          | obligation
+          | cost
+          | limit
+          | choice
+          | setup
+          | transfer
+          | state_change
+
+trigger: "WHEN" STRING "THEN" STRING
+condition: "IF" STRING "THEN" STRING
+permission: STRING "MAY" STRING
+obligation: STRING "MUST" STRING
+cost: STRING "COSTS" INT STRING
+limit: STRING "IS" "LIMITED" "TO" INT "PER" STRING
+choice: STRING "CHOOSES" INT "FROM" string_list
+setup: "SETUP" STRING
+transfer: "TRANSFER" INT STRING "FROM" STRING "TO" STRING
+state_change: STATE_VERB STRING
+
+string_list: STRING ("," STRING)+
+
+STATE_VERB: "IMPROVE" | "WORSEN"
+RULE_ID: /[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z0-9._-]+)*/
+STRING: ESCAPED_STRING
+
+%import common.ESCAPED_STRING
+%import common.INT
+%import common.WS
+%ignore WS

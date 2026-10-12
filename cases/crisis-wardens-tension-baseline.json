@@ -1,0 +1,11 @@
+{
+  "id": "cw:tension:baseline-v0.2",
+  "scenario_id": "SCN-001",
+  "character_ids": ["CHR-001", "CHR-002"],
+  "ruleset_id": "cw:rules:provisional-core-v0.2",
+  "seed": 1,
+  "max_turns": 80,
+  "player_policy": "greedy",
+  "deck_order": [],
+  "overrides": []
+}

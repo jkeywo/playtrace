@@ -1,0 +1,14 @@
+{
+  "contract_version": 1,
+  "base_image": "python:3.12.11-slim@sha256:47ae396f09c1303b8653019811a8498470603d7ffefc29cb07c88f1f8cb3d19f",
+  "dependency_lock": "uv.lock",
+  "dependency_lock_sha256": "8136d5a0f67715470ab7a5e05b11f9c8ad761b20280386fce60ea15837d08964",
+  "runtime_user": "playtrace:playtrace",
+  "required_runner_controls": [
+    "--network",
+    "--read-only",
+    "--memory",
+    "--cpus",
+    "--pids-limit"
+  ]
+}

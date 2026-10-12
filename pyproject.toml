@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "playtrace"
+version = "0.1.0"
+description = "Evidence-backed reasoning infrastructure for games in development"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+  "lark>=1.2,<2",
+  "pydantic>=2.12,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<10",
+]
+
+[project.scripts]
+playtrace = "playtrace.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/playtrace"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/playtrace/grammar/tabletop.lark" = "playtrace/grammar/tabletop.lark"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --basetemp=.test-tmp"

@@ -1,0 +1,32 @@
+[
+  {
+    "id": "playtrace:policy:evidence-labeling",
+    "title": "Label unsupported judgment",
+    "statement": "Every material recommendation must cite applicable evidence, policy, or precedent, or be explicitly labelled unsupported judgment.",
+    "severity": "hard",
+    "layer": "shared",
+    "scope": {},
+    "rationale": "Judgment remains useful, but it must not masquerade as evidence.",
+    "source": "policy/evidence-discipline.json"
+  },
+  {
+    "id": "playtrace:policy:no-silent-authority",
+    "title": "No silent authority mutation",
+    "statement": "Derived analysis and experiments may become canonical changes only through an explicit reviewed proposal.",
+    "severity": "hard",
+    "layer": "shared",
+    "scope": {},
+    "rationale": "Canonical game sources remain authoritative and reversible.",
+    "source": "policy/evidence-discipline.json"
+  },
+  {
+    "id": "playtrace:policy:preserve-disagreement",
+    "title": "Preserve critic disagreement",
+    "statement": "Material critic disagreement must be shown as a trade-off rather than averaged into a consensus score.",
+    "severity": "strong_preference",
+    "layer": "shared",
+    "scope": {},
+    "rationale": "Design trade-offs require human judgment.",
+    "source": "policy/evidence-discipline.json"
+  }
+]

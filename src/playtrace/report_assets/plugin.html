@@ -1,0 +1,20 @@
+<main id="pt-plugin-report">
+<style>/* REPORT_STYLE */</style>
+<header><div><p class="eyebrow">PLAYTRACE / REPLAY</p><h1>Follow the game, action by action.</h1><p id="pt-summary" class="muted"></p></div>
+<label class="trace-label">Trace <select id="pt-trace"></select></label></header>
+<section class="transport" aria-label="Replay controls">
+<button id="pt-prev" type="button">← Previous</button><button id="pt-next" type="button">Next →</button>
+<input id="pt-position" type="range" min="0" value="0" aria-label="Action position"><span id="pt-counter"></span>
+</section>
+<div class="workspace"><aside class="panel"><h2>Action history</h2><p class="muted">Choose an action to inspect its result.</p><ol id="pt-log" aria-label="Action history"></ol></aside>
+<section class="main-panel">
+<section class="action panel" aria-live="polite"><p id="pt-phase" class="eyebrow"></p><h2 id="pt-description"></h2><div id="pt-affected" aria-label="Changed tabs"></div></section>
+<section class="panel" id="pt-card-panel" hidden><h2>Cards involved in this action</h2><p class="muted">Select a card to enlarge it. Front and back images are included in this report.</p><div id="pt-cards" class="card-gallery"></div></section>
+<section class="panel state-panel"><div id="pt-tabs" role="tablist" aria-label="Players and locations"></div>
+<div id="pt-tab-content" role="tabpanel" tabindex="0"></div></section>
+<details class="panel technical"><summary>Technical details and source references</summary><h3>Event and source references</h3><pre id="pt-event"></pre><h3>Blockers</h3><pre id="pt-blockers"></pre><h3>Complete state checkpoint</h3><pre id="pt-state"></pre></details>
+</section></div>
+<dialog id="pt-card-dialog" aria-labelledby="pt-card-title"><div class="card-dialog-toolbar"><h2 id="pt-card-title"></h2><button id="pt-card-close" type="button">Close</button></div><div id="pt-card-faces"></div><img id="pt-card-large" alt=""><p id="pt-card-note" class="muted"></p><a id="pt-card-download">Download this face</a></dialog>
+<script>/* REPORT_SCRIPT */
+PlayTraceReplay.mount(document.getElementById('pt-plugin-report'), /* REPORT_DATA */[]);</script>
+</main>
